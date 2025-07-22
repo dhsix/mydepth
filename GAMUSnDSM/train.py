@@ -55,10 +55,6 @@ def create_datasets(args, logger):
     logger.info("创建数据集...")
     
     # 构建数据路径
-    # train_image_dir = os.path.join(args.data_dir, 'images', 'train')
-    # train_label_dir = os.path.join(args.data_dir, 'height', 'train')
-    # val_image_dir = os.path.join(args.data_dir, 'images', 'val')
-    # val_label_dir = os.path.join(args.data_dir, 'height', 'val')
     train_image_dir = os.path.join(args.data_dir, 'train','images' )
     train_label_dir = os.path.join(args.data_dir, 'train','depths' )
     val_image_dir = os.path.join(args.data_dir, 'val','images' )
@@ -427,7 +423,7 @@ def main():
     parser = argparse.ArgumentParser(description='简化版GAMUS nDSM训练脚本')
     
     # 基本参数
-    parser.add_argument('--data_dir', type=str, required=True,
+    parser.add_argument('--data_dir', type=str, default='/home/hudong26/HeightData/GAMUS/',
                         help='数据根目录 (包含images和height子目录)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='模型保存目录')
