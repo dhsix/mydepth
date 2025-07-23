@@ -181,7 +181,7 @@ def predict_samples(model, dataset, device, num_samples, logger):
                 prediction_np = prediction.squeeze(0).cpu().numpy()
                 
                 # Denormalize to real height values
-                height_normalizer = dataset.get_height_normalizer()
+                height_normalizer = dataset.get_normalizer()
                 target_real = height_normalizer.denormalize(target_np)
                 prediction_real = height_normalizer.denormalize(prediction_np)
                 
@@ -587,13 +587,13 @@ def main():
                         help='Data root directory (containing images and height subdirectories)')
     
     # Model parameters (must match training settings)
-    parser.add_argument('--encoder', type=str, default='vits',
+    parser.add_argument('--encoder', type=str, default='vitb',
                         choices=['vits', 'vitb', 'vitl', 'basic_cnn'],
                         help='Encoder type (must match training settings)')
     parser.add_argument('--pretrained_path', type=str, default=None,
                         help='Pretrained model path (for model structure creation)')
-    parser.add_argument('--stats_json_path', type=str, required=True,
-                    help='预计算统计信息文件路径')
+    parser.add_argument('--stats_json_path', type=str, default='./gamus_full_stats.json',
+                        help='预计算统计信息JSON文件路径')
     parser.add_argument('--min_height', type=float, default=-5.0,
                     help='最小高度过滤值（米）')
     parser.add_argument('--max_height', type=float, default=200.0,

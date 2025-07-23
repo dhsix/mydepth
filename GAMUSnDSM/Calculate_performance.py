@@ -56,7 +56,7 @@ def load_trained_model(checkpoint_path, device, logger):
             model_state_dict = checkpoint['model_state_dict']
             logger.info(f"检查点信息:")
             logger.info(f"  训练轮次: {checkpoint.get('epoch', 'N/A')}")
-            logger.info(f"  验证损失: {checkpoint.get('val_loss', 'N/A'):.6f}")
+            # logger.info(f"  验证损失: {checkpoint.get('val_loss', 'N/A'):.6f}")
             if 'metrics' in checkpoint:
                 metrics = checkpoint['metrics']
                 logger.info(f"  训练时最佳指标:")
@@ -453,7 +453,7 @@ def main():
                         help='数据根目录 (包含images和height子目录)')
     
     # 模型参数（需要与训练时一致）
-    parser.add_argument('--encoder', type=str, default='vits',
+    parser.add_argument('--encoder', type=str, default='vitb',
                         choices=['vits', 'vitb', 'vitl', 'basic_cnn'],
                         help='编码器类型（需要与训练时一致）')
     parser.add_argument('--pretrained_path', type=str, default=None,
@@ -466,7 +466,10 @@ def main():
     parser.add_argument('--file_extension', type=str, default='auto',
                         choices=['auto', 'tif', 'tiff', 'png', 'jpg', 'jpeg'],
                         help='数据文件扩展名')
-    
+    parser.add_argument('--min_height', type=float, default=-5.0,
+                    help='最小高度过滤值（米）')
+    parser.add_argument('--max_height', type=float, default=200.0,
+                    help='最大高度过滤值（米）')        
     # 测试参数
     parser.add_argument('--batch_size', type=int, default=8,
                         help='测试批次大小')
@@ -476,7 +479,8 @@ def main():
                         help='计算设备')
     parser.add_argument('--save_dir', type=str, default='./test_results',
                         help='测试结果保存目录')
-    
+    parser.add_argument('--stats_json_path', type=str, default='./gamus_full_stats.json',
+                        help='预计算统计信息JSON文件路径')     
     # 损失函数参数
     parser.add_argument('--loss_type', type=str, default='huber',
                         choices=['mse', 'mae', 'huber', 'focal', 'combined'],
@@ -561,7 +565,7 @@ def main():
         metrics = calculate_detailed_metrics(
             test_results['predictions'], 
             test_results['targets'],
-            test_dataset.get_height_normalizer(),
+            test_dataset.get_normalizer(),
             logger
         )
         
@@ -603,7 +607,7 @@ def main():
             create_test_visualizations(
                 test_results['predictions'], 
                 test_results['targets'],
-                test_dataset.get_height_normalizer(),
+                test_dataset.get_normalizer(),
                 args.save_dir, 
                 logger, 
                 args.num_vis_samples
