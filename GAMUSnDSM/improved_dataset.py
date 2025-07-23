@@ -52,7 +52,7 @@ class GAMUSDataset(Dataset):
         self.force_recompute = force_recompute
 
         # 设置高度过滤器（默认合理范围）
-        self.height_filter = height_filter or {'min_height': -5.0, 'max_height': 100.0}
+        self.height_filter = height_filter or {'min_height': -5.0, 'max_height': 200.0}
         
         # 验证目录
         self._validate_directories()
