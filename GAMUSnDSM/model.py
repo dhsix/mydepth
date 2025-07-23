@@ -163,9 +163,9 @@ class SimplifiedDPTHead(nn.Module):
 
 class SimpleNDSMHead(nn.Module):
     """简单的nDSM预测头"""
-    def __init__(self, input_channels=1):
+    def __init__(self, input_channels=1, enable_zero_output=True):
         super().__init__()
-        
+        self.enable_zero_output = enable_zero_output
         self.layers = nn.Sequential(
             # 保持448x448分辨率的卷积
             nn.Conv2d(input_channels, 32, kernel_size=7, padding=3),
@@ -185,7 +185,7 @@ class SimpleNDSMHead(nn.Module):
             nn.ReLU(inplace=True),
             
             nn.Conv2d(16, 1, kernel_size=1),
-            nn.Sigmoid()  # 输出[0,1]范围，适合归一化的nDSM
+            # nn.Sigmoid()  # 输出[0,1]范围，适合归一化的nDSM
         )
         
         self._initialize_weights()
@@ -201,7 +201,17 @@ class SimpleNDSMHead(nn.Module):
                 nn.init.constant_(module.bias, 0)
     
     def forward(self, x):
-        return self.layers(x).squeeze(1)  # 移除通道维度
+        x = self.layers(x)
+        
+        if self.enable_zero_output:
+            # 使用ReLU确保非负，然后clamp到[0,1]
+            x = F.relu(x)
+            x = torch.clamp(x, 0, 1)
+        else:
+            # 原来的Sigmoid方式
+            x = torch.sigmoid(x)
+        
+        return x.squeeze(1)  # 移除通道维度
 
 class GAMUSNDSMPredictor(nn.Module):
     """GAMUS nDSM预测模型 - 针对448x448输入优化"""

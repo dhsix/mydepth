@@ -175,7 +175,7 @@ class SimpleGAMUSValidator:
         # 收集少量样本用于指标计算（避免内存问题）
         all_preds_real = []
         all_targets_real = []
-        max_samples = 10000  # 限制样本数量
+        max_samples = 100000  # 限制样本数量
         
         with torch.no_grad():
             pbar = tqdm(val_loader, desc=f'Validation', leave=False)
