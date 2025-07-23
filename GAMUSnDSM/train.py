@@ -109,7 +109,39 @@ def create_datasets(args, logger):
         if hasattr(train_dataset, 'global_min'):
             logger.info(f"✅ 使用预计算统计信息，数据范围: [{train_dataset.global_min:.2f}, {train_dataset.global_max:.2f}] 米")
         # 获取高度归一化器
-        height_normalizer = train_dataset.height_normalizer  # 假设数据集有这个属性
+        height_normalizer = train_dataset.get_normalizer() # 假设数据集有这个属性
+        if hasattr(height_normalizer, 'global_min_h') and hasattr(height_normalizer, 'global_max_h'):
+            min_height = height_normalizer.global_min_h
+            max_height = height_normalizer.global_max_h
+            logger.info(f"✅ 从归一化器获取真实高度范围: [{min_height:.2f}, {max_height:.2f}] 米")
+        elif hasattr(height_normalizer, 'min_val') and hasattr(height_normalizer, 'max_val'):
+            min_height = height_normalizer.min_val
+            max_height = height_normalizer.max_val
+            logger.info(f"✅ 从归一化器获取真实高度范围: [{min_height:.2f}, {max_height:.2f}] 米")
+        else:
+            # 备用方案：使用配置参数
+            min_height = args.min_height
+            max_height = args.max_height
+            logger.warning(f"⚠️ 无法从归一化器获取高度范围，使用配置参数: [{min_height:.2f}, {max_height:.2f}] 米")
+        
+        # ✅ 计算高度范围用于损失函数
+        height_range = max_height - min_height
+        logger.info(f"📊 高度范围跨度: {height_range:.2f} 米")
+        
+        # ✅ 计算并显示归一化阈值信息（用于调试）
+        ground_norm_threshold = 5.0 / height_range if height_range > 0 else 0.05
+        low_norm_threshold = 20.0 / height_range if height_range > 0 else 0.2
+        mid_norm_threshold = 50.0 / height_range if height_range > 0 else 0.5
+        high_norm_threshold = min(0.8, 80.0 / height_range) if height_range > 0 else 0.8
+        
+        logger.info(f"🎯 归一化阈值映射:")
+        logger.info(f"   地面层 (0-5m): 归一化值 ≤ {ground_norm_threshold:.3f}")
+        logger.info(f"   低建筑 (5-20m): 归一化值 {ground_norm_threshold:.3f} - {low_norm_threshold:.3f}")
+        logger.info(f"   中建筑 (20-50m): 归一化值 {low_norm_threshold:.3f} - {mid_norm_threshold:.3f}")
+        logger.info(f"   高建筑 (50-80m): 归一化值 {mid_norm_threshold:.3f} - {high_norm_threshold:.3f}")
+        logger.info(f"   超高建筑 (>80m): 归一化值 > {high_norm_threshold:.3f}")        
+        
+        
         logger.info("✓ 训练数据集创建成功")
     except Exception as e:
         logger.error(f"创建训练数据集失败: {e}")
@@ -153,7 +185,7 @@ def create_datasets(args, logger):
         logger.error(f"数据加载测试失败: {e}")
         raise
     
-    return train_loader, val_loader, train_dataset, height_normalizer
+    return train_loader, val_loader, train_dataset, height_normalizer, min_height, max_height
 class SimpleGAMUSValidator:
     """简化的GAMUS验证器"""
     
@@ -431,11 +463,11 @@ def main():
                         help='预计算统计信息JSON文件路径')
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=12,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='批次大小')
-    parser.add_argument('--num_epochs', type=int, default=20,
+    parser.add_argument('--num_epochs', type=int, default=40,
                         help='训练轮数')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
+    parser.add_argument('--learning_rate', type=float, default=1e-5,
                         help='学习率')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='数据加载线程数')
@@ -528,7 +560,7 @@ def main():
     try:
         # 创建数据集
         # train_loader, val_loader, train_dataset = create_datasets(args, logger)
-        train_loader, val_loader, train_dataset, height_normalizer = create_datasets(args, logger)
+        train_loader, val_loader, train_dataset, height_normalizer, min_height, max_height = create_datasets(args, logger)
         # 创建模型
         logger.info("创建模型...")
         model = create_gamus_model(
@@ -562,9 +594,15 @@ def main():
         # 创建损失函数
         criterion = create_height_loss(
             loss_type=args.loss_type,
-            height_aware=args.height_aware
+            height_aware=args.height_aware,
+            height_normalizer=height_normalizer,  # 传入归一化器
+            min_height=min_height,                # 传入真实最小高度
+            max_height=max_height                 # 传入真实最大高度
         )
-        
+        logger.info(f"📊 损失函数配置:")
+        logger.info(f"   类型: {args.loss_type}")
+        logger.info(f"   高度感知: {args.height_aware}")
+        logger.info(f"   高度范围: [{min_height:.2f}, {max_height:.2f}] 米")
         # 训练循环
         logger.info("开始训练...")
         best_val_loss = float('inf')

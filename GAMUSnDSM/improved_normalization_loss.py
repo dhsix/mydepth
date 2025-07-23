@@ -201,7 +201,12 @@ class ImprovedHeightLoss(nn.Module):
                  height_aware=True,
                  huber_delta=0.1,
                  focal_alpha=2.0,
-                 weights=None):
+                 weights=None,
+                 ground_constraint_weight=0.2,
+                 ground_threshold=0.1,
+                 height_normalizer=None,  # 新增：传入归一化器
+                 min_height=None,         # 新增：最小高度
+                 max_height=None):        # 新增：最大高度
         """
         初始化损失函数
         
@@ -217,6 +222,26 @@ class ImprovedHeightLoss(nn.Module):
         self.height_aware = height_aware
         self.huber_delta = huber_delta
         self.focal_alpha = focal_alpha
+        self.ground_constraint_weight = ground_constraint_weight
+        self.ground_threshold = ground_threshold       
+        # 高度范围信息
+        self.height_normalizer = height_normalizer
+        if height_normalizer is not None:
+            self.min_height = getattr(height_normalizer, 'global_min_h', 
+                                    getattr(height_normalizer, 'min_val', min_height or -5.0))
+            self.max_height = getattr(height_normalizer, 'global_max_h',
+                                    getattr(height_normalizer, 'max_val', max_height or 200.0))
+        else:
+            self.min_height = min_height or -5.0
+            self.max_height = max_height or 200.0
+        
+        self.height_range = self.max_height - self.min_height
+        
+        # 计算归一化阈值
+        self.ground_norm_threshold = 5.0 / self.height_range
+        self.low_norm_threshold = 20.0 / self.height_range  
+        self.mid_norm_threshold = 50.0 / self.height_range
+        self.high_norm_threshold = min(0.8, 80.0 / self.height_range)
         
         # 默认权重
         self.weights = weights or {
@@ -242,17 +267,21 @@ class ImprovedHeightLoss(nn.Module):
         weights = torch.ones_like(targets)
         
         if self.height_aware:
-            # 地面/低值区域 (0-0.2)
-            low_mask = targets <= 0.2
-            weights[low_mask] *= 0.8
+            # 使用预计算的归一化阈值
+            ground_mask = targets <= self.ground_norm_threshold
+            weights[ground_mask] *= 1.5
             
-            # 中等高度区域 (0.2-0.6)
-            medium_mask = (targets > 0.2) & (targets <= 0.6)
-            weights[medium_mask] *= 1.2
+            low_mask = (targets > self.ground_norm_threshold) & (targets <= self.low_norm_threshold)
+            weights[low_mask] *= 2.0
             
-            # 高值区域 (0.6-1.0)
-            high_mask = targets > 0.6
-            weights[high_mask] *= 2.0
+            mid_mask = (targets > self.low_norm_threshold) & (targets <= self.mid_norm_threshold)
+            weights[mid_mask] *= 4.0
+            
+            high_mask = (targets > self.mid_norm_threshold) & (targets <= self.high_norm_threshold)
+            weights[high_mask] *= 8.0
+            
+            very_high_mask = targets > self.high_norm_threshold
+            weights[very_high_mask] *= 15.0
         
         return weights
     
@@ -440,18 +469,25 @@ def create_height_normalizer(method='minmax', height_filter=None):
     return HeightNormalizer(method=method, height_filter=height_filter)
 
 
-def create_height_loss(loss_type='mse', height_aware=True, **kwargs):
+def create_height_loss(loss_type='mse', height_aware=True, height_normalizer=None, 
+                      min_height=None, max_height=None, **kwargs):
     """
     创建高度损失函数
     
     Args:
         loss_type: 损失类型 ('mse', 'mae', 'huber', 'focal', 'combined')
         height_aware: 是否使用高度感知权重
+        height_normalizer: 高度归一化器
+        min_height: 最小高度值（米）
+        max_height: 最大高度值（米）
         **kwargs: 其他参数
     """
     return ImprovedHeightLoss(
         loss_type=loss_type,
         height_aware=height_aware,
+        height_normalizer=height_normalizer,
+        min_height=min_height,
+        max_height=max_height,
         **kwargs
     )
 
