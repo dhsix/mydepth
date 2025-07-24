@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-带mask功能的GAMUS nDSM训练脚本
-仅针对building和tree类别进行训练和预测
+支持多模型对比的GAMUS nDSM训练脚本
+可以训练GAMUS模型和Depth2Elevation模型
 """
 
 import os
@@ -23,9 +23,9 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 warnings.filterwarnings('ignore')
 
 # 导入修改后的数据集模块
-from improved_dataset_with_mask import create_gamus_dataloader  # 修改：使用带mask的数据集
+from improved_dataset_with_mask import create_gamus_dataloader
 from improved_normalization_loss import create_height_loss
-from model import create_gamus_model
+from model_with_comparison import create_gamus_model  # 使用支持多模型的版本
 
 def setup_logger(log_path):
     """设置日志记录"""
@@ -60,12 +60,12 @@ def create_datasets(args, logger):
     val_image_dir = os.path.join(args.data_dir, 'val','images' )
     val_label_dir = os.path.join(args.data_dir, 'val','depths' )
     
-    # 新增：mask路径
+    # mask路径
     train_mask_dir = None
     val_mask_dir = None
     if args.mask_dir:
-        train_mask_dir = os.path.join(args.mask_dir, 'train', 'masks')
-        val_mask_dir = os.path.join(args.mask_dir, 'val', 'masks')
+        train_mask_dir = os.path.join(args.mask_dir, 'train', 'classes')
+        val_mask_dir = os.path.join(args.mask_dir, 'val', 'classes')
         
         logger.info(f"检查mask数据路径:")
         logger.info(f"  训练mask目录: {train_mask_dir}")
@@ -84,11 +84,10 @@ def create_datasets(args, logger):
         if not os.path.exists(path):
             raise FileNotFoundError(f"目录不存在: {path}")
         else:
-            # 统计文件数量
             files = os.listdir(path)
             logger.info(f"  {path}: {len(files)} 个文件")
     
-    # ✅ 检查统计信息文件路径
+    # 检查统计信息文件路径
     if not args.stats_json_path:
         args.stats_json_path = os.path.join(args.save_dir, 'gamus_stats.json')
         logger.warning(f"⚠️ 未指定统计信息文件，使用默认路径: {args.stats_json_path}")
@@ -105,7 +104,7 @@ def create_datasets(args, logger):
     }
     logger.info(f"高度过滤器: {height_filter}")
     
-    # 新增：mask配置
+    # mask配置
     if args.mask_dir:
         logger.info(f"🎯 Mask配置:")
         logger.info(f"   建筑类别ID: {args.building_class_id}")
@@ -117,9 +116,9 @@ def create_datasets(args, logger):
         train_loader, train_dataset = create_gamus_dataloader(
             image_dir=train_image_dir,
             label_dir=train_label_dir,
-            mask_dir=train_mask_dir,  # 新增
-            building_class_id=args.building_class_id,  # 新增
-            tree_class_id=args.tree_class_id,  # 新增
+            mask_dir=train_mask_dir,
+            building_class_id=args.building_class_id,
+            tree_class_id=args.tree_class_id,
             batch_size=args.batch_size,
             shuffle=True,
             normalization_method=args.normalization_method,
@@ -127,10 +126,9 @@ def create_datasets(args, logger):
             stats_json_path=args.stats_json_path,
             height_filter=height_filter,
             force_recompute=False,
-            num_workers=min(args.num_workers, 2)  # 减少worker数量避免卡住
+            num_workers=min(args.num_workers, 2)
         )
         
-        # 检查是否使用了预计算统计信息
         if hasattr(train_dataset, 'global_min'):
             logger.info(f"✅ 使用预计算统计信息，数据范围: [{train_dataset.global_min:.2f}, {train_dataset.global_max:.2f}] 米")
         
@@ -145,12 +143,10 @@ def create_datasets(args, logger):
             max_height = height_normalizer.max_val
             logger.info(f"✅ 从归一化器获取真实高度范围: [{min_height:.2f}, {max_height:.2f}] 米")
         else:
-            # 备用方案：使用配置参数
             min_height = args.min_height
             max_height = args.max_height
             logger.warning(f"⚠️ 无法从归一化器获取高度范围，使用配置参数: [{min_height:.2f}, {max_height:.2f}] 米")
         
-        # ✅ 计算高度范围用于损失函数
         height_range = max_height - min_height
         logger.info(f"📊 高度范围跨度: {height_range:.2f} 米")
         
@@ -164,7 +160,6 @@ def create_datasets(args, logger):
     # 创建验证数据集
     val_loader = None
     if os.path.exists(val_image_dir) and os.path.exists(val_label_dir):
-        # 检查验证集mask目录
         if args.mask_dir and not os.path.exists(val_mask_dir):
             logger.warning(f"验证集mask目录不存在: {val_mask_dir}，将不使用mask")
             val_mask_dir = None
@@ -174,9 +169,9 @@ def create_datasets(args, logger):
             val_loader, _ = create_gamus_dataloader(
                 image_dir=val_image_dir,
                 label_dir=val_label_dir,
-                mask_dir=val_mask_dir,  # 新增
-                building_class_id=args.building_class_id,  # 新增
-                tree_class_id=args.tree_class_id,  # 新增
+                mask_dir=val_mask_dir,
+                building_class_id=args.building_class_id,
+                tree_class_id=args.tree_class_id,
                 batch_size=args.batch_size,
                 shuffle=False,
                 normalization_method=args.normalization_method,
@@ -202,7 +197,7 @@ def create_datasets(args, logger):
     logger.info("测试数据加载...")
     try:
         test_batch = next(iter(train_loader))
-        if len(test_batch) == 3:  # 包含mask
+        if len(test_batch) == 3:
             images, labels, masks = test_batch
             logger.info(f"✓ 数据加载测试成功: 图像 {images.shape}, 标签 {labels.shape}, mask {masks.shape}")
             logger.info(f"  mask统计: min={masks.min():.3f}, max={masks.max():.3f}, mean={masks.mean():.3f}")
@@ -233,16 +228,14 @@ class SimpleGAMUSValidator:
         total_loss = 0.0
         total_count = 0
         
-        # 收集少量样本用于指标计算（避免内存问题）
         all_preds_real = []
         all_targets_real = []
-        max_samples = 100000  # 限制样本数量
+        max_samples = 100000
         
         with torch.no_grad():
             pbar = tqdm(val_loader, desc=f'Validation', leave=False)
             
             for batch_idx, batch_data in enumerate(pbar):
-                # 修改：处理可能包含mask的batch数据
                 if len(batch_data) == 3:
                     images, labels, masks = batch_data
                     images = images.to(device)
@@ -252,29 +245,25 @@ class SimpleGAMUSValidator:
                     images, labels = batch_data
                     images = images.to(device)
                     labels = labels.to(device)
-                    masks = torch.ones_like(labels).to(device)  # 全1mask
+                    masks = torch.ones_like(labels).to(device)
                 
                 try:
-                    # 前向传播
                     predictions = model(images)
                     
-                    # 检查预测值
                     if torch.isnan(predictions).any() or torch.isinf(predictions).any():
                         self.logger.warning(f"预测值包含无效值，跳过批次 {batch_idx}")
                         continue
                     
-                    # 修改：计算带mask的损失
+                    # 计算带mask的损失
                     if isinstance(criterion, MaskedLoss):
                         loss = criterion(predictions, labels, masks)
                     else:
-                        # 对于不支持mask的损失函数，手动应用mask
-                        valid_mask = (masks > 0.5) & (labels >= 0)  # mask=1且标签有效
+                        valid_mask = (masks > 0.5) & (labels >= 0)
                         if valid_mask.sum() > 0:
                             loss = criterion(predictions[valid_mask], labels[valid_mask])
                         else:
                             continue
                     
-                    # 检查损失值
                     if torch.isnan(loss) or torch.isinf(loss):
                         self.logger.warning(f"损失值无效，跳过批次 {batch_idx}")
                         continue
@@ -282,47 +271,38 @@ class SimpleGAMUSValidator:
                     total_loss += loss.item()
                     total_count += 1
                     
-                    # 收集样本用于指标计算（采样以节省内存）
+                    # 收集样本用于指标计算
                     if len(all_preds_real) < max_samples:
-                        # 应用mask过滤
                         valid_mask = (masks > 0.5) & (labels >= 0)
                         if valid_mask.sum() > 0:
-                            # 转换为numpy并反归一化
                             preds_cpu = predictions[valid_mask].detach().cpu().numpy().flatten()
                             targets_cpu = labels[valid_mask].detach().cpu().numpy().flatten()
                             
-                            # 采样
-                            n_samples = min(500, len(preds_cpu))  # 每个批次最多500个样本
+                            n_samples = min(500, len(preds_cpu))
                             if len(preds_cpu) > n_samples:
                                 indices = np.random.choice(len(preds_cpu), n_samples, replace=False)
                                 preds_cpu = preds_cpu[indices]
                                 targets_cpu = targets_cpu[indices]
                             
-                            # 反归一化到真实高度
                             preds_real = self.denormalize_height(preds_cpu)
                             targets_real = self.denormalize_height(targets_cpu)
                             
                             all_preds_real.extend(preds_real)
                             all_targets_real.extend(targets_real)
                     
-                    # 更新进度条
                     pbar.set_postfix({'loss': f'{loss.item():.6f}'})
                     
                 except Exception as e:
                     self.logger.warning(f"验证批次 {batch_idx} 错误: {e}")
                     continue
         
-        # 计算平均损失
         avg_loss = total_loss / total_count if total_count > 0 else float('inf')
-        
-        # 计算详细指标
         metrics = {'loss': avg_loss}
         
         if all_preds_real and all_targets_real:
             all_preds_real = np.array(all_preds_real)
             all_targets_real = np.array(all_targets_real)
             
-            # 移除无效值
             valid_mask = (~np.isnan(all_preds_real) & ~np.isnan(all_targets_real) & 
                          ~np.isinf(all_preds_real) & ~np.isinf(all_targets_real))
             
@@ -330,23 +310,19 @@ class SimpleGAMUSValidator:
                 valid_preds = all_preds_real[valid_mask]
                 valid_targets = all_targets_real[valid_mask]
                 
-                # 基础指标
                 mae = mean_absolute_error(valid_targets, valid_preds)
                 mse = mean_squared_error(valid_targets, valid_preds)
                 rmse = np.sqrt(mse)
                 
-                # R²
                 ss_res = np.sum((valid_targets - valid_preds) ** 2)
                 ss_tot = np.sum((valid_targets - np.mean(valid_targets)) ** 2)
                 r2 = 1 - (ss_res / ss_tot) if ss_tot > 1e-10 else 0.0
                 
-                # 精度指标
                 errors = np.abs(valid_preds - valid_targets)
                 accuracy_1m = np.mean(errors <= 1.0)
                 accuracy_2m = np.mean(errors <= 2.0)
                 accuracy_5m = np.mean(errors <= 5.0)
                 
-                # 分层误差
                 ground_mask = (valid_targets >= -5) & (valid_targets <= 5)
                 low_mask = (valid_targets > 5) & (valid_targets <= 20)
                 mid_mask = (valid_targets > 20) & (valid_targets <= 50)
@@ -390,7 +366,6 @@ class SimpleGAMUSValidator:
         if is_best:
             self.logger.info('  ★ 最佳验证性能 ★')
 
-# 新增：带mask的损失函数包装器
 class MaskedLoss(nn.Module):
     """带mask的损失函数包装器"""
     
@@ -399,22 +374,11 @@ class MaskedLoss(nn.Module):
         self.base_criterion = base_criterion
     
     def forward(self, predictions, targets, masks):
-        """
-        计算带mask的损失
-        
-        参数:
-            predictions: 预测值 (B, H, W)
-            targets: 真实值 (B, H, W)
-            masks: mask (B, H, W), 1表示参与训练，0表示忽略
-        """
-        # 创建有效掩码：mask=1 且 targets有效
         valid_mask = (masks > 0.5) & (targets >= 0)
         
         if valid_mask.sum() == 0:
-            # 如果没有有效像素，返回0损失
             return torch.tensor(0.0, device=predictions.device, requires_grad=True)
         
-        # 只计算有效像素的损失
         valid_preds = predictions[valid_mask]
         valid_targets = targets[valid_mask]
         
@@ -425,13 +389,8 @@ def validate_model_enhanced(model, val_loader, criterion, device, logger, height
     if val_loader is None:
         return {'loss': 0.0, 'count': 0}
     
-    # 创建简化的验证器
     validator = SimpleGAMUSValidator(height_normalizer, logger)
-    
-    # 执行验证
     metrics = validator.validate_with_metrics(model, val_loader, criterion, device, epoch)
-    
-    # 记录指标
     validator.log_metrics(epoch, metrics)
     
     return metrics
@@ -445,7 +404,6 @@ def train_epoch(model, train_loader, criterion, optimizer, device, logger, epoch
     pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
     
     for batch_idx, batch_data in enumerate(pbar):
-        # 修改：处理可能包含mask的batch数据
         if len(batch_data) == 3:
             images, labels, masks = batch_data
             images = images.to(device)
@@ -455,48 +413,37 @@ def train_epoch(model, train_loader, criterion, optimizer, device, logger, epoch
             images, labels = batch_data
             images = images.to(device)
             labels = labels.to(device)
-            masks = torch.ones_like(labels).to(device)  # 全1mask
+            masks = torch.ones_like(labels).to(device)
         
         try:
             optimizer.zero_grad()
             
-            # 前向传播
             predictions = model(images)
             
-            # 检查预测值
             if torch.isnan(predictions).any() or torch.isinf(predictions).any():
                 logger.warning(f"预测值包含无效值，跳过批次 {batch_idx}")
                 continue
             
-            # 修改：计算带mask的损失
+            # 计算带mask的损失
             if isinstance(criterion, MaskedLoss):
                 loss = criterion(predictions, labels, masks)
             else:
-                # 对于不支持mask的损失函数，手动应用mask
-                valid_mask = (masks > 0.5) & (labels >= 0)  # mask=1且标签有效
+                valid_mask = (masks > 0.5) & (labels >= 0)
                 if valid_mask.sum() == 0:
-                    continue  # 跳过没有有效像素的批次
+                    continue
                 loss = criterion(predictions[valid_mask], labels[valid_mask])
             
-            # 检查损失值
             if torch.isnan(loss) or torch.isinf(loss) or loss > 10:
                 logger.warning(f"异常损失值 {loss.item():.6f}，跳过批次 {batch_idx}")
                 continue
             
-            # 反向传播
             loss.backward()
-            
-            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # 优化器步骤
             optimizer.step()
             
-            # 统计
             total_loss += loss.item()
             total_count += 1
             
-            # 更新进度条
             pbar.set_postfix({
                 'loss': f'{loss.item():.6f}',
                 'avg_loss': f'{total_loss/total_count:.6f}'
@@ -520,35 +467,36 @@ def train_epoch(model, train_loader, criterion, optimizer, device, logger, epoch
     
     return avg_loss
 
-def save_checkpoint(epoch, model, optimizer, loss, save_dir, is_best=False):
+def save_checkpoint(epoch, model, optimizer, loss, save_dir, is_best=False, model_type='gamus'):
     """保存检查点"""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
+        'model_type': model_type,  # 新增：记录模型类型
         'timestamp': datetime.now().isoformat()
     }
     
-    # 保存最新检查点
-    latest_path = os.path.join(save_dir, 'latest_checkpoint.pth')
+    # 根据模型类型调整文件名
+    prefix = f'{model_type}_'
+    
+    latest_path = os.path.join(save_dir, f'{prefix}latest_checkpoint.pth')
     torch.save(checkpoint, latest_path)
     
-    # 保存最佳模型
     if is_best:
-        best_path = os.path.join(save_dir, 'best_model.pth')
+        best_path = os.path.join(save_dir, f'{prefix}best_model.pth')
         torch.save(checkpoint, best_path)
         return best_path
     
-    # 定期保存
     if epoch % 10 == 0:
-        epoch_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
+        epoch_path = os.path.join(save_dir, f'{prefix}checkpoint_epoch_{epoch}.pth')
         torch.save(checkpoint, epoch_path)
     
     return latest_path
 
 def main():
-    parser = argparse.ArgumentParser(description='带mask功能的GAMUS nDSM训练脚本')
+    parser = argparse.ArgumentParser(description='支持多模型对比的GAMUS nDSM训练脚本')
     
     # 基本参数
     parser.add_argument('--data_dir', type=str, default='/home/hudong26/HeightData/GAMUS/',
@@ -558,12 +506,17 @@ def main():
     parser.add_argument('--stats_json_path', type=str, default='./gamus_full_stats.json',
                         help='预计算统计信息JSON文件路径')
     
-    # 新增：mask相关参数
-    parser.add_argument('--mask_dir', type=str, default='/home/hudong26/HeightData/GAMUS/',
+    # 新增：模型选择参数
+    parser.add_argument('--model_type', type=str, default='gamus',
+                        choices=['gamus', 'depth2elevation'],
+                        help='模型类型选择')
+    
+    # mask相关参数
+    parser.add_argument('--mask_dir', type=str, default=None,
                         help='classes mask根目录 (包含train/val/classes子目录)')
-    parser.add_argument('--building_class_id', type=int, default=3,
+    parser.add_argument('--building_class_id', type=int, default=6,
                         help='建筑类别ID')
-    parser.add_argument('--tree_class_id', type=int, default=6,
+    parser.add_argument('--tree_class_id', type=int, default=5,
                         help='树木类别ID')
     
     # 训练参数
@@ -595,10 +548,19 @@ def main():
     parser.add_argument('--encoder', type=str, default='vitb',
                         choices=['vits', 'vitb', 'vitl'],
                         help='编码器类型')
-    parser.add_argument('--pretrained_path', type=str, default='/home/hudong26/hudong26/Height/Depth-Anything-V2/checkpoints/depth_anything_v2_vitb.pth',
+    parser.add_argument('--pretrained_path', type=str, 
+                        default='/home/hudong26/hudong26/Height/Depth-Anything-V2/checkpoints/depth_anything_v2_vitb.pth',
                         help='预训练模型路径')
     parser.add_argument('--freeze_encoder', action='store_true',
                         help='冻结编码器')
+    
+    # 新增：Depth2Elevation特定参数
+    parser.add_argument('--use_multi_scale_output', action='store_true',
+                        help='使用多尺度输出（仅对Depth2Elevation有效）')
+    parser.add_argument('--img_size', type=int, default=448,
+                        help='输入图像尺寸')
+    parser.add_argument('--patch_size', type=int, default=14,
+                        help='Patch尺寸（仅对Depth2Elevation有效）')
     
     # 损失函数参数
     parser.add_argument('--loss_type', type=str, default='mse',
@@ -621,17 +583,15 @@ def main():
     
     args = parser.parse_args()
     
-    # ✅ 验证关键参数
+    # 验证关键参数
     if not os.path.exists(args.data_dir):
         print(f"❌ 数据目录不存在: {args.data_dir}")
         return 1
     
-    # 验证mask目录
     if args.mask_dir and not os.path.exists(args.mask_dir):
         print(f"❌ Mask目录不存在: {args.mask_dir}")
         return 1
     
-    # 如果指定了统计信息文件路径但文件不存在，给出明确提示
     if args.stats_json_path and not os.path.exists(args.stats_json_path):
         print(f"❌ 统计信息文件不存在: {args.stats_json_path}")
         print(f"💡 请先运行: python precompute_stats.py {args.data_dir} --output {args.stats_json_path}")
@@ -642,18 +602,15 @@ def main():
     
     # 设置日志
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = os.path.join(args.save_dir, f'training_{timestamp}.log')
+    log_file = os.path.join(args.save_dir, f'training_{args.model_type}_{timestamp}.log')
     logger = setup_logger(log_file)
     
-    # 设置调试模式
     if args.debug:
         logger.setLevel(logging.DEBUG)
-        logging.getLogger('improved_dataset_with_mask').setLevel(logging.DEBUG)
-        logging.getLogger('improved_normalization_loss').setLevel(logging.DEBUG)
     
     # 打印配置
     logger.info("=" * 60)
-    logger.info("带mask功能的GAMUS nDSM训练")
+    logger.info(f"多模型对比训练 - 当前模型: {args.model_type.upper()}")
     logger.info("=" * 60)
     logger.info(f"配置参数: {json.dumps(vars(args), indent=2, ensure_ascii=False)}")
     
@@ -672,13 +629,28 @@ def main():
         # 创建数据集
         train_loader, val_loader, train_dataset, height_normalizer, min_height, max_height = create_datasets(args, logger)
         
-        # 创建模型
-        logger.info("创建模型...")
-        model = create_gamus_model(
-            encoder=args.encoder,
-            pretrained_path=args.pretrained_path,
-            freeze_encoder=args.freeze_encoder
-        ).to(device)
+        # 创建模型 - 支持多种模型类型
+        logger.info(f"创建{args.model_type}模型...")
+        
+        # 准备模型配置
+        model_kwargs = {
+            'encoder': args.encoder,
+            'pretrained_path': args.pretrained_path,
+            'freeze_encoder': args.freeze_encoder,
+            'model_type': args.model_type
+        }
+        
+        # 为Depth2Elevation添加特定参数
+        if args.model_type == 'depth2elevation':
+            model_kwargs.update({
+                'img_size': args.img_size,
+                'patch_size': args.patch_size,
+                'use_multi_scale_output': args.use_multi_scale_output,
+                'loss_config': {},  # 可以根据需要配置
+                'freezing_config': {}  # 可以根据需要配置
+            })
+        
+        model = create_gamus_model(**model_kwargs).to(device)
         
         # 统计模型参数
         total_params = sum(p.numel() for p in model.parameters())
@@ -711,7 +683,7 @@ def main():
             max_height=max_height
         )
         
-        # 新增：包装为带mask的损失函数
+        # 包装为带mask的损失函数
         criterion = MaskedLoss(base_criterion)
         
         logger.info(f"📊 损失函数配置:")
@@ -753,7 +725,7 @@ def main():
                 
                 # 保存检查点
                 saved_path = save_checkpoint(
-                    epoch, model, optimizer, val_loss, args.save_dir, is_best
+                    epoch, model, optimizer, val_loss, args.save_dir, is_best, args.model_type
                 )
                 
                 # 打印结果
@@ -776,6 +748,7 @@ def main():
         # 训练完成
         total_time = time.time() - start_time
         logger.info(f"训练完成!")
+        logger.info(f"模型类型: {args.model_type}")
         logger.info(f"总耗时: {total_time / 3600:.2f} 小时")
         logger.info(f"最佳验证损失: {best_val_loss:.6f}")
         logger.info(f"模型保存在: {args.save_dir}")
