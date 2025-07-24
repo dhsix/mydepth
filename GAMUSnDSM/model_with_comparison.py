@@ -31,7 +31,7 @@ except ImportError as e:
 # ==================== 新增：Depth2Elevation模型支持 ====================
 try:
     # 导入新模型的组件（假设它们在相应的模块中）
-    from .depth2elevation import create_depth2elevation_model, Depth2Elevation
+    from depth2elevation import create_depth2elevation_model, Depth2Elevation
     DEPTH2ELEVATION_AVAILABLE = True
     logging.info("Depth2Elevation模块导入成功")
 except ImportError as e:
