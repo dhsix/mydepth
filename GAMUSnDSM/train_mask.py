@@ -64,8 +64,8 @@ def create_datasets(args, logger):
     train_mask_dir = None
     val_mask_dir = None
     if args.mask_dir:
-        train_mask_dir = os.path.join(args.mask_dir, 'train', 'classes')
-        val_mask_dir = os.path.join(args.mask_dir, 'val', 'classes')
+        train_mask_dir = os.path.join(args.mask_dir, 'train', 'masks')
+        val_mask_dir = os.path.join(args.mask_dir, 'val', 'masks')
         
         logger.info(f"检查mask数据路径:")
         logger.info(f"  训练mask目录: {train_mask_dir}")
@@ -559,7 +559,7 @@ def main():
                         help='预计算统计信息JSON文件路径')
     
     # 新增：mask相关参数
-    parser.add_argument('--mask_dir', type=str, default=None,
+    parser.add_argument('--mask_dir', type=str, default='/home/hudong26/HeightData/GAMUS/',
                         help='classes mask根目录 (包含train/val/classes子目录)')
     parser.add_argument('--building_class_id', type=int, default=6,
                         help='建筑类别ID')
