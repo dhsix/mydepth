@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 多模型对比测试脚本（大数据集优化版本）
-支持GAMUS和Depth2Elevation模型，支持mask功能
+支持GAMUS、Depth2Elevation和IMELE模型，支持mask功能
 用于评估已训练模型的精度，针对12000+样本进行内存和速度优化
 """
 
@@ -46,7 +46,7 @@ def setup_logger(log_path):
     return logger
 
 def load_trained_model(checkpoint_path, device, logger):
-    """加载已训练的模型"""
+    """加载已训练的模型，包含配置信息"""
     logger.info(f"正在加载模型检查点: {checkpoint_path}")
     
     try:
@@ -55,18 +55,26 @@ def load_trained_model(checkpoint_path, device, logger):
         # 提取模型参数和类型信息
         if 'model_state_dict' in checkpoint:
             model_state_dict = checkpoint['model_state_dict']
-            model_type = checkpoint.get('model_type', 'gamus')  # 获取模型类型
+            model_type = checkpoint.get('model_type', 'gamus')
+            # ✅ 尝试读取训练时的模型配置
+            model_config = checkpoint.get('model_config', {})
+            
             logger.info(f"检查点信息:")
             logger.info(f"  模型类型: {model_type}")
             logger.info(f"  训练轮次: {checkpoint.get('epoch', 'N/A')}")
             if isinstance(checkpoint.get('loss'), (int, float)):
                 logger.info(f"  验证损失: {checkpoint.get('loss'):.6f}")
+            if model_config:
+                logger.info(f"  模型配置: {model_config}")
+            else:
+                logger.warning("  检查点中未找到模型配置，将使用命令行参数")
         else:
             model_state_dict = checkpoint
             model_type = 'gamus'  # 默认为gamus
+            model_config = {}
             logger.info("检查点为直接的模型状态字典，假设为GAMUS模型")
         
-        return model_state_dict, model_type
+        return model_state_dict, model_type, model_config
         
     except Exception as e:
         logger.error(f"加载检查点失败: {e}")
@@ -129,7 +137,6 @@ def create_test_dataset(data_dir, args, logger):
             mask_dir=test_mask_dir,
             building_class_id=args.building_class_id,
             tree_class_id=args.tree_class_id,
-            # use_all_classes=args.use_all_classes,
             batch_size=args.batch_size,
             shuffle=False,
             normalization_method=args.normalization_method,
@@ -638,6 +645,52 @@ def create_quick_visualizations(test_results, save_dir, logger, model_type):
     except Exception as e:
         logger.error(f"生成可视化失败: {e}")
 
+def create_test_model_with_config(model_type, model_config, args, logger):
+    """根据训练时配置创建测试模型"""
+    
+    # 基础参数
+    model_kwargs = {
+        'model_type': model_type,
+        'freeze_encoder': True,  # 测试时总是冻结编码器
+    }
+    
+    if model_type == 'gamus':
+        # ✅ 使用训练时的实际配置，而不是强制使用基础版本
+        model_kwargs.update({
+            'encoder': model_config.get('encoder', args.encoder),
+            'pretrained_path': args.pretrained_path,
+            'use_adaptive_aggregation': model_config.get('use_adaptive_aggregation', getattr(args, 'use_adaptive_aggregation', False)),
+            'use_height_attention': model_config.get('use_height_attention', getattr(args, 'use_height_attention', False)),
+            'use_canopy_refinement': model_config.get('use_canopy_refinement', getattr(args, 'use_canopy_refinement', False)),
+        })
+        
+    elif model_type == 'depth2elevation':
+        # ✅ 使用训练时的实际配置
+        model_kwargs.update({
+            'encoder': model_config.get('encoder', args.encoder),
+            'img_size': model_config.get('img_size', 448),
+            'patch_size': model_config.get('patch_size', 14),
+            'use_multi_scale_output': model_config.get('use_multi_scale_output', getattr(args, 'use_multi_scale_output', False)),
+            'pretrained_path': args.pretrained_path,
+            'loss_config': model_config.get('loss_config', {}),
+            'freezing_config': model_config.get('freezing_config', {})
+        })
+        
+    elif model_type == 'imele':
+        # ✅ 使用训练时的实际配置
+        model_kwargs.update({
+            'backbone': model_config.get('backbone', args.backbone),
+            'pretrained': model_config.get('pretrained', True),
+            'loss_type': model_config.get('loss_type', args.loss_type)
+        })
+    
+    logger.info(f"使用训练时配置创建{model_type}模型:")
+    for key, value in model_kwargs.items():
+        if key != 'model_type':
+            logger.info(f"  {key}: {value}")
+    
+    return create_gamus_model(**model_kwargs)
+
 def main():
     parser = argparse.ArgumentParser(description='多模型对比测试脚本（大数据集优化版本）')
     
@@ -651,13 +704,33 @@ def main():
     
     # 模型参数（会从检查点自动推断，这里作为备用）
     parser.add_argument('--model_type', type=str, default='auto',
-                        choices=['auto', 'gamus', 'depth2elevation'],
+                        choices=['auto', 'gamus', 'depth2elevation', 'imele'],  # ✅ 添加imele
                         help='模型类型（auto表示从检查点自动推断）')
     parser.add_argument('--encoder', type=str, default='vitb',
                         choices=['vits', 'vitb', 'vitl'],
                         help='编码器类型（需要与训练时一致）')
     parser.add_argument('--pretrained_path', type=str, default=None,
                         help='预训练模型路径（用于模型结构创建）')
+    
+    # ✅ 新增：IMELE backbone参数
+    parser.add_argument('--backbone', type=str, default='resnet50',
+                        choices=['resnet50', 'densenet161', 'senet154'],
+                        help='IMELE模型的backbone类型（仅对IMELE有效）')
+    
+    # ✅ 新增：GAMUS和Depth2Elevation的高级功能参数（作为备用）
+    parser.add_argument('--use_adaptive_aggregation', action='store_true',
+                        help='使用自适应聚合（需要与训练时一致）')
+    parser.add_argument('--use_height_attention', action='store_true',
+                        help='使用高度注意力（需要与训练时一致）')
+    parser.add_argument('--use_canopy_refinement', action='store_true',
+                        help='使用树冠细化（需要与训练时一致）')
+    parser.add_argument('--use_multi_scale_output', action='store_true',
+                        help='使用多尺度输出（需要与训练时一致）')
+    
+    # ✅ 新增：配置来源选择
+    parser.add_argument('--config_source', type=str, default='checkpoint',
+                        choices=['checkpoint', 'args'],
+                        help='配置来源：checkpoint(从检查点读取) 或 args(从命令行参数)')
     
     # 数据参数（需要与训练时一致）
     parser.add_argument('--normalization_method', type=str, default='minmax',
@@ -675,8 +748,6 @@ def main():
                         help='建筑类别ID')
     parser.add_argument('--tree_class_id', type=int, default=6,
                         help='树木类别ID')
-    # parser.add_argument('--use_all_classes', action='store_true',
-    #                     help='使用所有类别而不只是building+tree')
     
     # 测试参数
     parser.add_argument('--batch_size', type=int, default=8,
@@ -739,8 +810,8 @@ def main():
             torch.backends.cudnn.deterministic = False
             logger.info("启用CUDA优化")
         
-        # 加载训练好的权重和模型类型
-        model_state_dict, detected_model_type = load_trained_model(args.checkpoint_path, device, logger)
+        # ✅ 加载训练好的权重、模型类型和配置
+        model_state_dict, detected_model_type, model_config = load_trained_model(args.checkpoint_path, device, logger)
         
         # 确定模型类型
         if args.model_type == 'auto':
@@ -750,27 +821,50 @@ def main():
         
         logger.info(f"使用模型类型: {model_type}")
         
-        # 创建模型结构
+        # ✅ 创建模型结构（使用正确的配置）
         logger.info("创建模型结构...")
         try:
-            model_kwargs = {
-                'encoder': args.encoder,
-                'pretrained_path': args.pretrained_path,
-                'freeze_encoder': True,  # 测试时冻结编码器
-                'model_type': model_type
-            }
-            
-            # 为Depth2Elevation添加特定参数
-            if model_type == 'depth2elevation':
-                model_kwargs.update({
-                    'img_size': 448,
-                    'patch_size': 14,
-                    'use_multi_scale_output': False,  # 测试时使用单尺度
-                    'loss_config': {},
-                    'freezing_config': {}
-                })
-            
-            model = create_gamus_model(**model_kwargs)
+            if args.config_source == 'checkpoint' and model_config:
+                # 方案1：从检查点读取配置（推荐）
+                model = create_test_model_with_config(model_type, model_config, args, logger)
+            else:
+                # 方案2：从命令行参数读取配置
+                logger.info("使用命令行参数创建模型（请确保与训练时一致）")
+                
+                model_kwargs = {
+                    'encoder': args.encoder,
+                    'pretrained_path': args.pretrained_path,
+                    'freeze_encoder': True,  # 测试时冻结编码器
+                    'model_type': model_type
+                }
+                
+                # ✅ 为GAMUS模型添加特定参数（使用命令行参数）
+                if model_type == 'gamus':
+                    model_kwargs.update({
+                        'use_adaptive_aggregation': args.use_adaptive_aggregation,
+                        'use_height_attention': args.use_height_attention,
+                        'use_canopy_refinement': args.use_canopy_refinement,
+                    })
+                    
+                # ✅ 为Depth2Elevation添加特定参数
+                elif model_type == 'depth2elevation':
+                    model_kwargs.update({
+                        'img_size': 448,
+                        'patch_size': 14,
+                        'use_multi_scale_output': args.use_multi_scale_output,
+                        'loss_config': {},
+                        'freezing_config': {}
+                    })
+                
+                # ✅ 为IMELE添加特定参数
+                elif model_type == 'imele':
+                    model_kwargs.update({
+                        'backbone': args.backbone,
+                        'pretrained': True,
+                        'loss_type': args.loss_type
+                    })
+                
+                model = create_gamus_model(**model_kwargs)
             
         except Exception as e:
             logger.error(f"创建模型失败: {e}")

@@ -20,13 +20,21 @@ except ImportError as e:
     logging.debug(f"DINOv2模块导入失败: {e}")
     logging.debug("将使用简化的预训练编码器")
     DINOV2_AVAILABLE = False
-    
     class DINOv2:
         pass
     class FeatureFusionBlock:
         pass
     def _make_scratch(*args, **kwargs):
         pass
+
+# 在文件顶部导入
+try:
+    from imele_adapter import IMELEAdapter
+    IMELE_AVAILABLE = True
+    logging.info("IMELE模块导入成功")
+except ImportError as e:
+    IMELE_AVAILABLE = False
+    logging.warning(f"IMELE模块不可用: {e}")
 
 # ==================== 新增：Depth2Elevation模型支持 ====================
 try:
@@ -672,6 +680,7 @@ class SimpleNDSMHead(nn.Module):
     def __init__(self, input_channels=1, enable_zero_output=True,use_canopy_refinement=False):
         super().__init__()
         self.enable_zero_output = enable_zero_output
+        self.use_canopy_refinement = use_canopy_refinement
         self.layers = nn.Sequential(
             nn.Conv2d(input_channels, 32, kernel_size=7, padding=3),
             nn.BatchNorm2d(32),
@@ -731,6 +740,7 @@ class GAMUSNDSMPredictor(nn.Module):
                  use_pretrained_dpt=True,
                  use_adaptive_aggregation=False,
                  use_height_attention=False,  # 新增参数
+                 use_canopy_refinement=False,
                  pretrained_path=None):
         super().__init__()
         
@@ -1002,7 +1012,26 @@ def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True
         }
         
         model = Depth2ElevationAdapter(model_config)
+    elif model_type.lower() == 'imele':
+        # 创建IMELE模型适配器
+        if not IMELE_AVAILABLE:
+            raise ImportError("IMELE模块不可用，请检查安装和路径")
         
+        logging.info("创建IMELE模型")
+        
+        # 构建IMELE模型配置
+        model_config = {
+            'backbone': kwargs.get('backbone', 'resnet50'),  # 支持resnet50, densenet161, senet154
+            'pretrained': kwargs.get('pretrained', True),
+            'freeze_encoder': freeze_encoder,
+            'loss_type': kwargs.get('loss_type', 'l1')  # 支持l1, mse, combined
+        }
+        
+        model = IMELEAdapter(model_config)
+        
+        # 加载预训练权重
+        if pretrained_path:
+            model.load_pretrained_weights(pretrained_path)
     else:
         raise ValueError(f"不支持的模型类型: {model_type}. 支持的类型: 'gamus', 'depth2elevation'")
     

@@ -568,6 +568,9 @@ def main():
     parser.add_argument('--patch_size', type=int, default=14,
                         help='Patch尺寸（仅对Depth2Elevation有效）')
     
+    parser.add_argument('--backbone', type=str, default='resnet50',
+                    choices=['resnet50', 'densenet161', 'senet154'],
+                    help='IMELE模型的backbone类型（仅对IMELE有效）')
     # 损失函数参数
     parser.add_argument('--loss_type', type=str, default='huber',
                         choices=['mse', 'mae', 'huber', 'focal', 'combined'],
@@ -658,7 +661,13 @@ def main():
                 'loss_config': {},  # 可以根据需要配置
                 'freezing_config': {}  # 可以根据需要配置
             })
-        
+        # 为IMELE模型添加特定参数
+        if args.model_type == 'imele':
+            model_kwargs.update({
+                'backbone': args.backbone,
+                'pretrained': True,
+                'loss_type': args.loss_type  # 复用现有的loss_type参数
+            })
         model = create_gamus_model(**model_kwargs).to(device)
         
         # 统计模型参数
