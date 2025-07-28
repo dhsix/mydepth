@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-GAMUS nDSM模型测试脚本（大数据集优化版本）
+多模型对比测试脚本（大数据集优化版本）
+支持GAMUS和Depth2Elevation模型，支持mask功能
 用于评估已训练模型的精度，针对12000+样本进行内存和速度优化
 """
 
@@ -20,11 +21,10 @@ from tqdm import tqdm
 import json
 import gc
 
-# 导入您的模块
-from improved_dataset import GAMUSDataset
-from improved_normalization_loss import ImprovedHeightLoss
-from model import GAMUSNDSMPredictor, create_gamus_model
-from optimized_validation import GAMUSValidationMetricsCalculator
+# 导入更新后的模块
+from improved_dataset_with_mask import create_gamus_dataloader
+from improved_normalization_loss import create_height_loss
+from model_with_comparison import create_gamus_model
 
 def setup_logger(log_path):
     """设置日志记录"""
@@ -52,47 +52,52 @@ def load_trained_model(checkpoint_path, device, logger):
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
-        # 提取模型参数
+        # 提取模型参数和类型信息
         if 'model_state_dict' in checkpoint:
             model_state_dict = checkpoint['model_state_dict']
+            model_type = checkpoint.get('model_type', 'gamus')  # 获取模型类型
             logger.info(f"检查点信息:")
+            logger.info(f"  模型类型: {model_type}")
             logger.info(f"  训练轮次: {checkpoint.get('epoch', 'N/A')}")
-            if isinstance(checkpoint.get('val_loss'), (int, float)):
-                logger.info(f"  验证损失: {checkpoint.get('val_loss'):.6f}")
-            if 'metrics' in checkpoint:
-                metrics = checkpoint['metrics']
-                logger.info(f"  训练时最佳指标:")
-                logger.info(f"    MAE: {metrics.get('mae', 'N/A')}")
-                logger.info(f"    RMSE: {metrics.get('rmse', 'N/A')}")
-                logger.info(f"    R²: {metrics.get('r2', 'N/A')}")
+            if isinstance(checkpoint.get('loss'), (int, float)):
+                logger.info(f"  验证损失: {checkpoint.get('loss'):.6f}")
         else:
             model_state_dict = checkpoint
-            logger.info("检查点为直接的模型状态字典")
+            model_type = 'gamus'  # 默认为gamus
+            logger.info("检查点为直接的模型状态字典，假设为GAMUS模型")
         
-        return model_state_dict
+        return model_state_dict, model_type
         
     except Exception as e:
         logger.error(f"加载检查点失败: {e}")
         raise
 
 def create_test_dataset(data_dir, args, logger):
-    """创建测试数据集"""
+    """创建测试数据集（支持mask）"""
     logger.info("创建测试数据集...")
     
     # 测试集路径
     test_image_dir = os.path.join(data_dir, 'test','images')
     test_label_dir = os.path.join(data_dir, 'test','depths')
+    test_mask_dir = None
+    
+    if args.mask_dir:
+        test_mask_dir = os.path.join(args.mask_dir, 'test', 'classes')
     
     # 如果没有专门的测试集，使用验证集
     if not os.path.exists(test_image_dir):
         test_image_dir = os.path.join(data_dir, 'val','images')
         test_label_dir = os.path.join(data_dir, 'val','depths')
+        if args.mask_dir:
+            test_mask_dir = os.path.join(args.mask_dir, 'val', 'classes')
         logger.info("未找到测试集，使用验证集进行测试")
     
     # 如果还是没有，使用训练集的一部分
     if not os.path.exists(test_image_dir):
         test_image_dir = os.path.join(data_dir, 'train','images')
         test_label_dir = os.path.join(data_dir, 'train','depths')
+        if args.mask_dir:
+            test_mask_dir = os.path.join(args.mask_dir, 'train', 'classes')
         logger.info("未找到验证集，使用训练集进行测试（注意：这可能导致过拟合的结果）")
     
     if not os.path.exists(test_image_dir):
@@ -100,54 +105,65 @@ def create_test_dataset(data_dir, args, logger):
     if not os.path.exists(test_label_dir):
         raise FileNotFoundError(f"测试标签目录不存在: {test_label_dir}")
     
+    # 检查mask目录
+    if args.mask_dir and test_mask_dir and not os.path.exists(test_mask_dir):
+        logger.warning(f"Mask目录不存在: {test_mask_dir}，将不使用mask")
+        test_mask_dir = None
+    
     logger.info(f"测试图像目录: {test_image_dir}")
     logger.info(f"测试标签目录: {test_label_dir}")
+    if test_mask_dir:
+        logger.info(f"测试mask目录: {test_mask_dir}")
     
-    # 创建训练数据集以获取归一化器
-    train_image_dir = os.path.join(data_dir, 'train','images')
-    train_label_dir = os.path.join(data_dir, 'train','depths')
-     
-    train_dataset = GAMUSDataset(
-        image_dir=train_image_dir,
-        label_dir=train_label_dir,
-        normalization_method=args.normalization_method,
-        enable_augmentation=False,
-        # file_extension=args.file_extension
-        stats_json_path=args.stats_json_path,
-        height_filter={'min_height': args.min_height, 'max_height': args.max_height}  # ✅ 添加高度过滤
-
-    )
+    # 设置高度过滤器
+    height_filter = {
+        'min_height': args.min_height,
+        'max_height': args.max_height
+    }
     
-    # 创建测试数据集（使用训练集的归一化器）
-    test_dataset = GAMUSDataset(
-        image_dir=test_image_dir,
-        label_dir=test_label_dir,
-        normalization_method=args.normalization_method,
-        enable_augmentation=False,
-        stats_json_path=args.stats_json_path,
-        height_filter={'min_height': args.min_height, 'max_height': args.max_height}  # ✅ 添加高度过滤
-    )
+    # 创建数据加载器（支持mask）
+    try:
+        test_loader, test_dataset = create_gamus_dataloader(
+            image_dir=test_image_dir,
+            label_dir=test_label_dir,
+            mask_dir=test_mask_dir,
+            building_class_id=args.building_class_id,
+            tree_class_id=args.tree_class_id,
+            # use_all_classes=args.use_all_classes,
+            batch_size=args.batch_size,
+            shuffle=False,
+            normalization_method=args.normalization_method,
+            enable_augmentation=False,
+            stats_json_path=args.stats_json_path,
+            height_filter=height_filter,
+            force_recompute=False,
+            num_workers=args.num_workers
+        )
+        
+        logger.info(f"测试集大小: {len(test_dataset)}")
+        
+        # 如果测试集太大，可以选择采样
+        if args.max_test_samples > 0 and len(test_dataset) > args.max_test_samples:
+            logger.info(f"测试集样本数({len(test_dataset)})超过限制({args.max_test_samples})，将进行随机采样")
+            # 创建子集
+            indices = np.random.choice(len(test_dataset), args.max_test_samples, replace=False)
+            test_dataset = torch.utils.data.Subset(test_dataset, indices)
+            
+            # 重新创建数据加载器
+            test_loader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=torch.cuda.is_available() and not args.disable_pin_memory,
+                drop_last=False,
+                prefetch_factor=2 if args.num_workers > 0 else 2
+            )
+            logger.info(f"采样后测试集大小: {len(test_dataset)}")
     
-    logger.info(f"测试集大小: {len(test_dataset)}")
-    
-    # 如果测试集太大，可以选择采样
-    if args.max_test_samples > 0 and len(test_dataset) > args.max_test_samples:
-        logger.info(f"测试集样本数({len(test_dataset)})超过限制({args.max_test_samples})，将进行随机采样")
-        # 创建子集
-        indices = np.random.choice(len(test_dataset), args.max_test_samples, replace=False)
-        test_dataset = torch.utils.data.Subset(test_dataset, indices)
-        logger.info(f"采样后测试集大小: {len(test_dataset)}")
-    
-    # 创建数据加载器
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available() and not args.disable_pin_memory,
-        drop_last=False,
-        prefetch_factor=2 if args.num_workers > 0 else 2
-    )
+    except Exception as e:
+        logger.error(f"创建测试数据集失败: {e}")
+        raise
     
     return test_loader, test_dataset
 
@@ -191,8 +207,17 @@ class OnlineMetricsCalculator:
         self.min_pred = float('inf')
         self.max_pred = float('-inf')
     
-    def update(self, predictions, targets):
-        """更新统计信息"""
+    def update(self, predictions, targets, masks=None):
+        """更新统计信息（支持mask）"""
+        # 应用mask过滤
+        if masks is not None:
+            # 只处理mask=1且targets有效的像素
+            valid_mask = (masks > 0.5) & (targets >= 0)
+            if valid_mask.sum() == 0:
+                return
+            predictions = predictions[valid_mask]
+            targets = targets[valid_mask]
+        
         # 反归一化到真实高度值
         pred_heights = self.height_normalizer.denormalize(predictions.flatten())
         target_heights = self.height_normalizer.denormalize(targets.flatten())
@@ -338,14 +363,19 @@ class OnlineMetricsCalculator:
         return metrics
 
 def test_model_optimized(model, test_loader, device, logger, criterion=None, memory_cleanup_interval=50):
-    """优化的模型测试函数"""
+    """优化的模型测试函数（支持mask）"""
     model.eval()
-    logger.info("开始模型测试（大数据集优化版本）...")
+    logger.info("开始模型测试（大数据集优化版本，支持mask）...")
     
-    # 使用在线指标计算器
+    # 获取归一化器
     if hasattr(test_loader.dataset, 'dataset'):
         # Subset情况
-        height_normalizer = test_loader.dataset.dataset.get_normalizer()
+        if hasattr(test_loader.dataset.dataset, 'get_normalizer'):
+            height_normalizer = test_loader.dataset.dataset.get_normalizer()
+        else:
+            # 从原始数据集获取
+            original_dataset = test_loader.dataset.dataset
+            height_normalizer = original_dataset.get_normalizer()
     else:
         height_normalizer = test_loader.dataset.get_normalizer()
     
@@ -360,11 +390,19 @@ def test_model_optimized(model, test_loader, device, logger, criterion=None, mem
     with torch.no_grad():
         test_pbar = tqdm(test_loader, desc='Testing Model')
         
-        for batch_idx, (images, targets) in enumerate(test_pbar):
+        for batch_idx, batch_data in enumerate(test_pbar):
             try:
-                # 移动数据到设备
-                images = images.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
+                # 处理可能包含mask的batch数据
+                if len(batch_data) == 3:
+                    images, targets, masks = batch_data
+                    images = images.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+                    masks = masks.to(device, non_blocking=True)
+                else:
+                    images, targets = batch_data
+                    images = images.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+                    masks = torch.ones_like(targets).to(device)  # 全1mask
                 
                 # 数据质量检查
                 if torch.isnan(images).any() or torch.isinf(images).any():
@@ -407,17 +445,31 @@ def test_model_optimized(model, test_loader, device, logger, criterion=None, mem
                 predictions = torch.clamp(predictions, 0, 1)
                 targets = torch.clamp(targets, 0, 1)
                 
-                # 计算损失
+                # 计算损失（考虑mask）
                 if criterion is not None:
                     try:
-                        loss = criterion(predictions, targets)
+                        # 如果损失函数支持mask
+                        if hasattr(criterion, 'forward') and 'masks' in criterion.forward.__code__.co_varnames:
+                            loss = criterion(predictions, targets, masks)
+                        else:
+                            # 手动应用mask
+                            valid_mask = (masks > 0.5) & (targets >= 0)
+                            if valid_mask.sum() > 0:
+                                loss = criterion(predictions[valid_mask], targets[valid_mask])
+                            else:
+                                continue
+                        
                         if not (torch.isnan(loss) or torch.isinf(loss)):
                             batch_losses.append(loss.item())
                     except Exception as e:
                         logger.warning(f"测试批次{batch_idx}损失计算错误: {e}")
                 
-                # 更新在线指标
-                metrics_calculator.update(predictions.cpu().numpy(), targets.cpu().numpy())
+                # 更新在线指标（传入mask）
+                metrics_calculator.update(
+                    predictions.cpu().numpy(), 
+                    targets.cpu().numpy(),
+                    masks.cpu().numpy() if len(batch_data) == 3 else None
+                )
                 
                 # 更新进度条
                 current_metrics = metrics_calculator.compute_metrics()
@@ -436,6 +488,8 @@ def test_model_optimized(model, test_loader, device, logger, criterion=None, mem
                 
                 # 清理当前批次的张量
                 del images, targets, predictions
+                if len(batch_data) == 3:
+                    del masks
                 
             except Exception as e:
                 logger.error(f"测试批次{batch_idx}处理错误: {e}")
@@ -471,12 +525,13 @@ def test_model_optimized(model, test_loader, device, logger, criterion=None, mem
         'failed_batches': failed_batches
     }
 
-def save_test_results(test_results, save_dir, logger):
+def save_test_results(test_results, save_dir, logger, model_type):
     """保存测试结果"""
-    results_file = os.path.join(save_dir, 'test_results.json')
+    results_file = os.path.join(save_dir, f'test_results_{model_type}.json')
     
     results = {
         'timestamp': datetime.now().isoformat(),
+        'model_type': model_type,
         'metrics': test_results['metrics'],
         'performance': {
             'avg_loss': test_results['avg_loss'],
@@ -493,7 +548,7 @@ def save_test_results(test_results, save_dir, logger):
     except Exception as e:
         logger.error(f"保存测试结果失败: {e}")
 
-def create_quick_visualizations(test_results, save_dir, logger):
+def create_quick_visualizations(test_results, save_dir, logger, model_type):
     """创建快速可视化（仅使用采样数据）"""
     logger.info("生成快速可视化图表...")
     
@@ -503,6 +558,7 @@ def create_quick_visualizations(test_results, save_dir, logger):
         
         # 创建指标总结图
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f'{model_type.upper()} 模型测试结果', fontsize=16)
         
         # 1. 基础指标条形图
         ax = axes[0, 0]
@@ -573,7 +629,7 @@ def create_quick_visualizations(test_results, save_dir, logger):
         
         plt.tight_layout()
         
-        summary_path = os.path.join(save_dir, 'test_summary.png')
+        summary_path = os.path.join(save_dir, f'test_summary_{model_type}.png')
         plt.savefig(summary_path, dpi=150, bbox_inches='tight')
         plt.close()
         
@@ -583,34 +639,44 @@ def create_quick_visualizations(test_results, save_dir, logger):
         logger.error(f"生成可视化失败: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description='GAMUS nDSM模型测试脚本（大数据集优化版本）')
+    parser = argparse.ArgumentParser(description='多模型对比测试脚本（大数据集优化版本）')
     
     # 必需参数
-    parser.add_argument('--checkpoint_path', type=str, default='./checkpoints/best_gamus_model.pth',
+    parser.add_argument('--checkpoint_path', type=str, required=True,
                         help='训练好的模型检查点路径')
     parser.add_argument('--data_dir', type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
-                        help='数据根目录 (包含images和height子目录)')
-    # 在第590行附近添加以下参数：
+                        help='数据根目录 (包含train/val/test子目录)')
     parser.add_argument('--stats_json_path', type=str, default='./gamus_full_stats.json',
                         help='预计算统计信息JSON文件路径')
-    parser.add_argument('--min_height', type=float, default=-5.0,
-                        help='最小高度过滤值（米）')
-    parser.add_argument('--max_height', type=float, default=200.0,
-                        help='最大高度过滤值（米）')    
-    # 模型参数（需要与训练时一致）
+    
+    # 模型参数（会从检查点自动推断，这里作为备用）
+    parser.add_argument('--model_type', type=str, default='auto',
+                        choices=['auto', 'gamus', 'depth2elevation'],
+                        help='模型类型（auto表示从检查点自动推断）')
     parser.add_argument('--encoder', type=str, default='vitb',
-                        choices=['vits', 'vitb', 'vitl', 'basic_cnn'],
+                        choices=['vits', 'vitb', 'vitl'],
                         help='编码器类型（需要与训练时一致）')
     parser.add_argument('--pretrained_path', type=str, default=None,
                         help='预训练模型路径（用于模型结构创建）')
     
     # 数据参数（需要与训练时一致）
     parser.add_argument('--normalization_method', type=str, default='minmax',
-                        choices=['minmax', 'log_minmax', 'sqrt_minmax', 'percentile', 'zscore_clip'],
+                        choices=['minmax', 'percentile', 'zscore'],
                         help='归一化方法（需要与训练时一致）')
-    parser.add_argument('--file_extension', type=str, default='auto',
-                        choices=['auto', 'tif', 'tiff', 'png', 'jpg', 'jpeg'],
-                        help='数据文件扩展名')
+    parser.add_argument('--min_height', type=float, default=-5.0,
+                        help='最小高度过滤值（米）')
+    parser.add_argument('--max_height', type=float, default=200.0,
+                        help='最大高度过滤值（米）')
+    
+    # mask相关参数
+    parser.add_argument('--mask_dir', type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
+                        help='classes mask根目录')
+    parser.add_argument('--building_class_id', type=int, default=3,
+                        help='建筑类别ID')
+    parser.add_argument('--tree_class_id', type=int, default=6,
+                        help='树木类别ID')
+    # parser.add_argument('--use_all_classes', action='store_true',
+    #                     help='使用所有类别而不只是building+tree')
     
     # 测试参数
     parser.add_argument('--batch_size', type=int, default=8,
@@ -631,7 +697,7 @@ def main():
                         help='禁用pin_memory以节省内存')
     
     # 损失函数参数
-    parser.add_argument('--loss_type', type=str, default='huber',
+    parser.add_argument('--loss_type', type=str, default='mse',
                         choices=['mse', 'mae', 'huber', 'focal', 'combined'],
                         help='损失函数类型')
     parser.add_argument('--height_aware_loss', action='store_true',
@@ -652,7 +718,7 @@ def main():
     logger = setup_logger(log_file)
     
     logger.info("=" * 80)
-    logger.info("GAMUS nDSM模型测试（大数据集优化版本）")
+    logger.info("多模型对比测试（大数据集优化版本）")
     logger.info("=" * 80)
     logger.info(f"测试参数: {vars(args)}")
     
@@ -673,23 +739,44 @@ def main():
             torch.backends.cudnn.deterministic = False
             logger.info("启用CUDA优化")
         
+        # 加载训练好的权重和模型类型
+        model_state_dict, detected_model_type = load_trained_model(args.checkpoint_path, device, logger)
+        
+        # 确定模型类型
+        if args.model_type == 'auto':
+            model_type = detected_model_type
+        else:
+            model_type = args.model_type
+        
+        logger.info(f"使用模型类型: {model_type}")
+        
         # 创建模型结构
         logger.info("创建模型结构...")
         try:
-            model = create_gamus_model(
-                encoder=args.encoder,
-                pretrained_path=args.pretrained_path,
-                freeze_encoder=True  # 测试时冻结编码器
-            )
+            model_kwargs = {
+                'encoder': args.encoder,
+                'pretrained_path': args.pretrained_path,
+                'freeze_encoder': True,  # 测试时冻结编码器
+                'model_type': model_type
+            }
+            
+            # 为Depth2Elevation添加特定参数
+            if model_type == 'depth2elevation':
+                model_kwargs.update({
+                    'img_size': 448,
+                    'patch_size': 14,
+                    'use_multi_scale_output': False,  # 测试时使用单尺度
+                    'loss_config': {},
+                    'freezing_config': {}
+                })
+            
+            model = create_gamus_model(**model_kwargs)
+            
         except Exception as e:
-            logger.warning(f"使用指定编码器失败: {e}, 尝试基础CNN")
-            model = GAMUSNDSMPredictor(
-                encoder='basic_cnn',
-                use_pretrained_dpt=False
-            )
+            logger.error(f"创建模型失败: {e}")
+            raise
         
-        # 加载训练好的权重
-        model_state_dict = load_trained_model(args.checkpoint_path, device, logger)
+        # 加载权重
         model.load_state_dict(model_state_dict, strict=False)
         model = model.to(device)
         model.eval()
@@ -701,10 +788,20 @@ def main():
         # 创建测试数据集
         test_loader, test_dataset = create_test_dataset(args.data_dir, args, logger)
         
+        # 获取归一化器（用于损失函数）
+        if hasattr(test_dataset, 'get_normalizer'):
+            height_normalizer = test_dataset.get_normalizer()
+        else:
+            # Subset情况，从原始数据集获取
+            height_normalizer = test_dataset.dataset.get_normalizer()
+        
         # 创建损失函数
-        criterion = ImprovedHeightLoss(
+        criterion = create_height_loss(
             loss_type=args.loss_type,
-            height_aware=args.height_aware_loss
+            height_aware=args.height_aware_loss,
+            height_normalizer=height_normalizer,
+            min_height=args.min_height,
+            max_height=args.max_height
         )
         
         # 执行优化的测试
@@ -721,7 +818,7 @@ def main():
         
         # 输出详细结果
         logger.info("\n" + "=" * 60)
-        logger.info("GAMUS nDSM模型测试结果")
+        logger.info(f"{model_type.upper()} 模型测试结果")
         logger.info("=" * 60)
         logger.info(f"基础指标:")
         logger.info(f"  MAE: {metrics['mae']:.4f} m")
@@ -756,18 +853,18 @@ def main():
         logger.info(f"  处理速度: {samples_per_second:.1f} 样本/秒")
         
         # 保存测试结果
-        save_test_results(test_results, args.save_dir, logger)
+        save_test_results(test_results, args.save_dir, logger, model_type)
         
         # 生成快速可视化
         if args.enable_visualization:
-            create_quick_visualizations(test_results, args.save_dir, logger)
+            create_quick_visualizations(test_results, args.save_dir, logger, model_type)
         
         logger.info("=" * 60)
         logger.info("测试完成!")
         logger.info(f"结果保存在: {args.save_dir}")
         
         # 性能总结
-        logger.info("\n性能总结:")
+        logger.info(f"\n{model_type.upper()} 模型性能总结:")
         logger.info(f"  最佳指标: MAE={metrics['mae']:.3f}m, RMSE={metrics['rmse']:.3f}m, R²={metrics['r2']:.3f}")
         logger.info(f"  推理效率: {samples_per_second:.1f} 样本/秒")
         

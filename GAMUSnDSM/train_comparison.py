@@ -64,8 +64,8 @@ def create_datasets(args, logger):
     train_mask_dir = None
     val_mask_dir = None
     if args.mask_dir:
-        train_mask_dir = os.path.join(args.mask_dir, 'train', 'classes')
-        val_mask_dir = os.path.join(args.mask_dir, 'val', 'classes')
+        train_mask_dir = os.path.join(args.mask_dir, 'train', 'masks')
+        val_mask_dir = os.path.join(args.mask_dir, 'val', 'masks')
         
         logger.info(f"检查mask数据路径:")
         logger.info(f"  训练mask目录: {train_mask_dir}")
@@ -499,7 +499,7 @@ def main():
     parser = argparse.ArgumentParser(description='支持多模型对比的GAMUS nDSM训练脚本')
     
     # 基本参数
-    parser.add_argument('--data_dir', type=str, default='/home/hudong26/HeightData/GAMUS/',
+    parser.add_argument('--data_dir', type=str, type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
                         help='数据根目录 (包含train/val子目录)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='模型保存目录')
@@ -512,19 +512,19 @@ def main():
                         help='模型类型选择')
     
     # mask相关参数
-    parser.add_argument('--mask_dir', type=str, default=None,
+    parser.add_argument('--mask_dir', type=str, type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
                         help='classes mask根目录 (包含train/val/classes子目录)')
-    parser.add_argument('--building_class_id', type=int, default=6,
+    parser.add_argument('--building_class_id', type=int, default=3,
                         help='建筑类别ID')
-    parser.add_argument('--tree_class_id', type=int, default=5,
+    parser.add_argument('--tree_class_id', type=int, default=6,
                         help='树木类别ID')
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=4,
                         help='批次大小')
-    parser.add_argument('--num_epochs', type=int, default=40,
+    parser.add_argument('--num_epochs', type=int, default=30,
                         help='训练轮数')
-    parser.add_argument('--learning_rate', type=float, default=1e-5,
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='学习率')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='数据加载线程数')

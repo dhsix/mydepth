@@ -89,8 +89,8 @@ class ResolutionAgnosticDecoder(nn.Module):
                 nn.Conv2d(out_channel//2, 32, 3, 1, 1),
                 nn.ReLU(True),
                 nn.Conv2d(32, 1, 1, 1, 0),
-                # nn.ReLU(True)
-                nn.Softplus()
+                nn.ReLU(True)
+                # nn.Softplus()
             ) for out_channel in self.out_channels
         ])
         
