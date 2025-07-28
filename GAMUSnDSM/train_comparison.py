@@ -230,7 +230,7 @@ class SimpleGAMUSValidator:
         
         all_preds_real = []
         all_targets_real = []
-        max_samples = 100000
+        max_samples = 200000
         
         with torch.no_grad():
             pbar = tqdm(val_loader, desc=f'Validation', leave=False)
@@ -499,7 +499,7 @@ def main():
     parser = argparse.ArgumentParser(description='支持多模型对比的GAMUS nDSM训练脚本')
     
     # 基本参数
-    parser.add_argument('--data_dir', type=str, type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
+    parser.add_argument('--data_dir', type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
                         help='数据根目录 (包含train/val子目录)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='模型保存目录')
@@ -512,7 +512,7 @@ def main():
                         help='模型类型选择')
     
     # mask相关参数
-    parser.add_argument('--mask_dir', type=str, type=str, default='/mnt/data1/UserData/hudong26/HeightData/',
+    parser.add_argument('--mask_dir', type=str,  default='/mnt/data1/UserData/hudong26/HeightData/',
                         help='classes mask根目录 (包含train/val/classes子目录)')
     parser.add_argument('--building_class_id', type=int, default=3,
                         help='建筑类别ID')
@@ -553,7 +553,12 @@ def main():
                         help='预训练模型路径')
     parser.add_argument('--freeze_encoder', action='store_true',
                         help='冻结编码器')
-    
+    # 新增：添加这一行
+    parser.add_argument('--use_adaptive_aggregation', action='store_true',
+                        help='启用自适应特征聚合模块（仅对GAMUS模型有效）')
+    parser.add_argument('--use_height_attention', action='store_true',
+                        help='启用高度感知注意力模块（仅对GAMUS模型有效）')
+
     # 新增：Depth2Elevation特定参数
     parser.add_argument('--use_multi_scale_output', action='store_true',
                         help='使用多尺度输出（仅对Depth2Elevation有效）')
@@ -563,7 +568,7 @@ def main():
                         help='Patch尺寸（仅对Depth2Elevation有效）')
     
     # 损失函数参数
-    parser.add_argument('--loss_type', type=str, default='mse',
+    parser.add_argument('--loss_type', type=str, default='huber',
                         choices=['mse', 'mae', 'huber', 'focal', 'combined'],
                         help='损失函数类型')
     parser.add_argument('--height_aware', action='store_true',
@@ -639,7 +644,10 @@ def main():
             'freeze_encoder': args.freeze_encoder,
             'model_type': args.model_type
         }
-        
+        # 为GAMUS模型添加自适应聚合参数
+        if args.model_type == 'gamus':
+            model_kwargs['use_adaptive_aggregation'] = args.use_adaptive_aggregation
+            model_kwargs['use_height_attention'] = args.use_height_attention
         # 为Depth2Elevation添加特定参数
         if args.model_type == 'depth2elevation':
             model_kwargs.update({
@@ -656,7 +664,9 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"模型参数: 总数={total_params:,}, 可训练={trainable_params:,}")
-        
+        # 新增：记录自适应聚合状态
+        if args.model_type == 'gamus':
+            logger.info(f"自适应特征聚合: {'启用' if args.use_adaptive_aggregation else '未启用'}")
         # 创建优化器
         optimizer = AdamW(
             [p for p in model.parameters() if p.requires_grad],

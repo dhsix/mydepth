@@ -45,6 +45,188 @@ except ImportError as e:
     class Depth2Elevation:
         pass
 
+# ==================== 新增：多尺度自适应特征聚合模块 ====================
+class AdaptiveFeatureAggregation(nn.Module):
+    """
+    多尺度自适应特征聚合网络
+    参考: FPN++ (CVPR 2019), PANet (CVPR 2018), EfficientDet (CVPR 2020)
+    创新: 结合高度估测任务的特点，引入高度敏感的自适应权重学习
+    """
+    
+    def __init__(self, feature_channels=[256, 512, 1024, 1024], 
+                 out_channels=256, num_scales=4):
+        super().__init__()
+        self.num_scales = num_scales
+        
+        # 特征对齐卷积
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(ch, out_channels, 1) for ch in feature_channels
+        ])
+        
+        # 自适应权重学习网络
+        self.attention_weights = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(out_channels, out_channels // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels // 4, 1, 1),
+                nn.Sigmoid()
+            ) for _ in range(num_scales)
+        ])
+        
+        # 高度敏感的特征增强模块
+        self.height_sensitive_conv = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=max(1, out_channels//8)),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, 1),
+                nn.BatchNorm2d(out_channels)
+            ) for _ in range(num_scales)
+        ])
+        
+        # 跨尺度特征交互模块
+        self.cross_scale_fusion = nn.ModuleList([
+            nn.Conv2d(out_channels * 2, out_channels, 3, padding=1)
+            for _ in range(num_scales - 1)
+        ])
+        
+        # 最终输出卷积
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(out_channels * num_scales, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 1)
+        )
+    
+    def forward(self, features):
+        """
+        Args:
+            features: List of feature maps from different scales
+        Returns:
+            Aggregated feature map
+        """
+        # Step 1: 特征对齐
+        aligned_features = []
+        for i, feat in enumerate(features):
+            aligned = self.lateral_convs[i](feat)
+            aligned_features.append(aligned)
+        
+        # Step 2: 自适应权重计算
+        weighted_features = []
+        for i, feat in enumerate(aligned_features):
+            weight = self.attention_weights[i](feat)
+            weighted_feat = feat * weight
+            weighted_features.append(weighted_feat)
+        
+        # Step 3: 高度敏感特征增强
+        enhanced_features = []
+        for i, feat in enumerate(weighted_features):
+            enhanced = self.height_sensitive_conv[i](feat)
+            enhanced = feat + enhanced  # 残差连接
+            enhanced_features.append(enhanced)
+        
+        # Step 4: 跨尺度特征交互 (自顶向下)
+        refined_features = [enhanced_features[-1]]  # 最高层特征
+        
+        for i in range(len(enhanced_features) - 2, -1, -1):
+            # 上采样高层特征
+            upsampled = F.interpolate(
+                refined_features[0], 
+                size=enhanced_features[i].shape[2:],
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+            # 特征融合
+            fused = torch.cat([enhanced_features[i], upsampled], dim=1)
+            refined = self.cross_scale_fusion[i](fused)
+            refined_features.insert(0, refined)
+        
+        # Step 5: 统一尺寸并聚合
+        target_size = refined_features[0].shape[2:]
+        resized_features = []
+        
+        for feat in refined_features:
+            if feat.shape[2:] != target_size:
+                feat = F.interpolate(feat, size=target_size, 
+                                   mode='bilinear', align_corners=False)
+            resized_features.append(feat)
+        
+        # 最终聚合
+        aggregated = torch.cat(resized_features, dim=1)
+        output = self.output_conv(aggregated)
+        
+        return output
+
+# ==================== 新增：高度感知注意力模块 ====================
+class HeightAwareAttention(nn.Module):
+    """高度感知的注意力机制"""
+    
+    def __init__(self, depth_channels=1, feature_channels=256):
+        super().__init__()
+        
+        # 高度分析网络
+        self.height_analyzer = nn.Sequential(
+            nn.Conv2d(depth_channels, 32, 7, padding=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 5, padding=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 4, 3, padding=1),  # 4个高度区间
+            nn.Softmax(dim=1)
+        )
+        
+        # 多高度区间的注意力权重
+        self.attention_weights = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(depth_channels, 32, 3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 1, 1),
+                nn.Sigmoid()
+            ) for _ in range(4)
+        ])
+        
+        # 高度自适应卷积
+        self.height_adaptive_conv = nn.Sequential(
+            nn.Conv2d(depth_channels, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, depth_channels, 1)
+        )
+    
+    def forward(self, depth_features):
+        """
+        Args:
+            depth_features: 深度特征 [B, 1, H, W]
+        Returns:
+            enhanced_depth: 增强的深度特征
+        """
+        # 分析高度分布
+        height_distribution = self.height_analyzer(depth_features)  # [B, 4, H, W]
+        
+        # 为每个高度区间计算注意力
+        attention_maps = []
+        for i, attention_layer in enumerate(self.attention_weights):
+            attention = attention_layer(depth_features)
+            # 加权当前高度区间的重要性
+            weighted_attention = attention * height_distribution[:, i:i+1]
+            attention_maps.append(weighted_attention)
+        
+        # 综合所有高度区间的注意力
+        combined_attention = sum(attention_maps)
+        
+        # 应用注意力增强
+        attended_depth = depth_features * (1 + combined_attention)
+        
+        # 高度自适应处理
+        adaptive_residual = self.height_adaptive_conv(attended_depth)
+        enhanced_depth = attended_depth + 0.1 * adaptive_residual
+        
+        return enhanced_depth
+
 # ==================== 原有代码保持不变 ====================
 def _make_fusion_block(features, use_bn, size=None):
     """创建特征融合块"""
@@ -101,9 +283,9 @@ class SimpleScratch(nn.Module):
 
 class SimplifiedDPTHead(nn.Module):
     """简化的DPT头部 - 适配448x448输入和nDSM预测"""
-    def __init__(self, in_channels, features=256, use_bn=False, out_channels=[256, 512, 1024, 1024]):
+    def __init__(self, in_channels, features=256, use_bn=False, out_channels=[256, 512, 1024, 1024], use_adaptive_aggregation=False):
         super().__init__()
-
+        self.use_adaptive_aggregation = use_adaptive_aggregation  # 新增属性
         self.projects = nn.ModuleList([
             nn.Conv2d(in_channels, out_channel, kernel_size=1)
             for out_channel in out_channels
@@ -115,16 +297,35 @@ class SimplifiedDPTHead(nn.Module):
             nn.Identity(),
             nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1)
         ])
-
-        if DINOV2_AVAILABLE:
-            self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
-            self.scratch.stem_transpose = None
-            self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
-            self.scratch.refinenet2 = _make_fusion_block(features, use_bn)
-            self.scratch.refinenet3 = _make_fusion_block(features, use_bn)
-            self.scratch.refinenet4 = _make_fusion_block(features, use_bn)
+                # 新增：条件性创建不同的特征聚合模块
+        if use_adaptive_aggregation:
+            logging.info("使用自适应特征聚合模块")
+            self.feature_aggregation = AdaptiveFeatureAggregation(
+                feature_channels=out_channels,
+                out_channels=features,
+                num_scales=4
+            )
         else:
-            self.scratch = SimpleScratch(out_channels, features)
+            logging.info("使用传统特征融合模块")
+            # 保持原有的逻辑
+            if DINOV2_AVAILABLE:
+                self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
+                self.scratch.stem_transpose = None
+                self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
+                self.scratch.refinenet2 = _make_fusion_block(features, use_bn)
+                self.scratch.refinenet3 = _make_fusion_block(features, use_bn)
+                self.scratch.refinenet4 = _make_fusion_block(features, use_bn)
+            else:
+                self.scratch = SimpleScratch(out_channels, features)
+        # if DINOV2_AVAILABLE:
+        #     self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
+        #     self.scratch.stem_transpose = None
+        #     self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
+        #     self.scratch.refinenet2 = _make_fusion_block(features, use_bn)
+        #     self.scratch.refinenet3 = _make_fusion_block(features, use_bn)
+        #     self.scratch.refinenet4 = _make_fusion_block(features, use_bn)
+        # else:
+        #     self.scratch = SimpleScratch(out_channels, features)
 
         self.output_conv = nn.Sequential(
             nn.Conv2d(features, features // 2, kernel_size=3, padding=1),
@@ -154,18 +355,34 @@ class SimplifiedDPTHead(nn.Module):
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             out.append(x)
+                # 修改：根据配置选择不同的特征聚合方式
+        if self.use_adaptive_aggregation:
+            # 使用新的自适应特征聚合
+            path_1 = self.feature_aggregation(out)
+        else:
+            # 保持原有的逻辑
+            layer_1, layer_2, layer_3, layer_4 = out
 
-        layer_1, layer_2, layer_3, layer_4 = out
+            layer_1_rn = self.scratch.layer1_rn(layer_1)
+            layer_2_rn = self.scratch.layer2_rn(layer_2)
+            layer_3_rn = self.scratch.layer3_rn(layer_3)
+            layer_4_rn = self.scratch.layer4_rn(layer_4)
 
-        layer_1_rn = self.scratch.layer1_rn(layer_1)
-        layer_2_rn = self.scratch.layer2_rn(layer_2)
-        layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
+            path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+            path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
+            path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
+            path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+        # layer_1, layer_2, layer_3, layer_4 = out
 
-        path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
-        path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+        # layer_1_rn = self.scratch.layer1_rn(layer_1)
+        # layer_2_rn = self.scratch.layer2_rn(layer_2)
+        # layer_3_rn = self.scratch.layer3_rn(layer_3)
+        # layer_4_rn = self.scratch.layer4_rn(layer_4)
+
+        # path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        # path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
+        # path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
+        # path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
         out = F.interpolate(path_1, size=(448, 448), mode="bilinear", align_corners=True)
         out = self.output_conv(out)
@@ -227,6 +444,8 @@ class GAMUSNDSMPredictor(nn.Module):
                  encoder='vits',
                  features=256,
                  use_pretrained_dpt=True,
+                 use_adaptive_aggregation=False,
+                 use_height_attention=False,  # 新增参数
                  pretrained_path=None):
         super().__init__()
         
@@ -253,9 +472,17 @@ class GAMUSNDSMPredictor(nn.Module):
             self.depth_head = SimplifiedDPTHead(
                 self.embed_dim, 
                 features, 
-                use_bn=False
+                use_bn=False,
+                use_adaptive_aggregation=use_adaptive_aggregation
             )
-        
+        # 新增：高度感知注意力模块
+        self.use_height_attention = use_height_attention
+        if use_height_attention:
+            self.height_attention = HeightAwareAttention(
+                depth_channels=1,
+                feature_channels=features
+            )
+            logging.info("启用高度感知注意力模块")
         self.ndsm_head = SimpleNDSMHead(input_channels=1)
         
         if pretrained_path and os.path.exists(pretrained_path):
@@ -324,7 +551,9 @@ class GAMUSNDSMPredictor(nn.Module):
                                torch.ones(1, depth.shape[1], 1, 1, device=depth.device) / depth.shape[1],
                                bias=None)
             depth = F.relu(depth)
-        
+        # 新增：应用高度感知注意力
+        if self.use_height_attention:
+            depth = self.height_attention(depth)
         ndsm_pred = self.ndsm_head(depth)
         
         return ndsm_pred
@@ -438,7 +667,7 @@ class Depth2ElevationAdapter(nn.Module):
 
 # ==================== 统一的模型创建函数 ====================
 def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True, 
-                      model_type='gamus', **kwargs):
+                      model_type='gamus',use_adaptive_aggregation=False, **kwargs):
     """
     创建模型的统一接口 - 支持多种模型类型
     
@@ -456,7 +685,9 @@ def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True
         model = GAMUSNDSMPredictor(
             encoder=encoder,
             use_pretrained_dpt=True,
-            pretrained_path=pretrained_path
+            pretrained_path=pretrained_path,
+            use_adaptive_aggregation=use_adaptive_aggregation,
+            use_height_attention=kwargs.get('use_height_attention', False),  # 新增参数
         )
         
         if freeze_encoder:
