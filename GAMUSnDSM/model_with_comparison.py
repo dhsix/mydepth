@@ -227,6 +227,284 @@ class HeightAwareAttention(nn.Module):
         
         return enhanced_depth
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CanopyEdgeRefinement(nn.Module):
+    """
+    树冠边缘细化模块
+    参考: Depth Any Canopy (2024), TreeLearn (2023), Mask R-CNN for tree crown delineation
+    创新: 专门针对树冠的不规则边界和细节保持
+    """
+    
+    def __init__(self, input_channels=1):
+        super().__init__()
+        
+        # 树冠纹理特征提取器（多尺度）
+        self.texture_extractors = nn.ModuleList([
+            # 小尺度纹理（叶片级别）
+            nn.Sequential(
+                nn.Conv2d(input_channels, 16, 3, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 16, 3, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True)
+            ),
+            # 中尺度纹理（树枝级别）
+            nn.Sequential(
+                nn.Conv2d(input_channels, 16, 5, padding=2),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 16, 5, padding=2),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True)
+            ),
+            # 大尺度纹理（树冠级别）
+            nn.Sequential(
+                nn.Conv2d(input_channels, 16, 7, padding=3),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 16, 7, padding=3),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True)
+            )
+        ])
+        
+        # 边缘检测网络（基于Sobel算子的学习版本）
+        self.edge_detector = nn.Sequential(
+            nn.Conv2d(input_channels, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 4, 1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(4, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        # 自适应边缘权重网络
+        self.edge_weight_net = nn.Sequential(
+            nn.Conv2d(48 + 1, 32, 3, padding=1),  # 48 from texture + 1 from edge
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        # 树冠内部平滑网络
+        self.internal_smoother = nn.Sequential(
+            nn.Conv2d(input_channels, 16, 5, padding=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, 1)
+        )
+        
+        # 最终细化网络
+        self.final_refiner = nn.Sequential(
+            nn.Conv2d(input_channels + 1, 16, 3, padding=1),  # input + edge_weight
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, 1)
+        )
+        
+    def forward(self, height_pred):
+        """
+        Args:
+            height_pred: 初始高度预测 [B, 1, H, W]
+        Returns:
+            refined_height: 边缘细化后的高度图
+            edge_map: 边缘图（用于可视化）
+        """
+        # Step 1: 多尺度纹理特征提取
+        texture_features = []
+        for extractor in self.texture_extractors:
+            texture_feat = extractor(height_pred)
+            texture_features.append(texture_feat)
+        
+        combined_texture = torch.cat(texture_features, dim=1)  # [B, 48, H, W]
+        
+        # Step 2: 边缘检测
+        edge_map = self.edge_detector(height_pred)  # [B, 1, H, W]
+        
+        # Step 3: 自适应边缘权重计算
+        edge_input = torch.cat([combined_texture, edge_map], dim=1)
+        edge_weight = self.edge_weight_net(edge_input)  # [B, 1, H, W]
+        
+        # Step 4: 树冠内部平滑
+        internal_smooth = self.internal_smoother(height_pred)
+        
+        # Step 5: 边缘感知的高度细化
+        # 在边缘区域保持细节，在内部区域进行平滑
+        smooth_weight = 1.0 - edge_weight
+        
+        # 细化输入
+        refine_input = torch.cat([height_pred, edge_weight], dim=1)
+        refinement = self.final_refiner(refine_input)
+        
+        # 最终结果：边缘保持 + 内部平滑
+        refined_height = (
+            height_pred + 
+            edge_weight * 0.1 * refinement +  # 边缘细节增强
+            smooth_weight * 0.05 * internal_smooth  # 内部平滑
+        )
+        
+        # 确保在合理范围内
+        refined_height = torch.clamp(refined_height, 0, 1)
+        
+        return refined_height, edge_map
+
+
+class CanopyAwareAttention(nn.Module):
+    """
+    树冠感知的注意力模块
+    参考: Vision Transformer for canopy height mapping
+    """
+    
+    def __init__(self, channels=1, reduction=8):
+        super().__init__()
+        
+        # 树冠类型分类器（针对不同树种的特征）
+        self.canopy_classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4),
+            nn.Conv2d(channels, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(16, 4),  # 4种树冠类型：针叶、阔叶、混合、稀疏
+            nn.Softmax(dim=1)
+        )
+        
+        # 基于树冠类型的自适应卷积
+        self.adaptive_convs = nn.ModuleList([
+            # 针叶林：注重垂直结构
+            nn.Sequential(
+                nn.Conv2d(channels, channels, (5, 3), padding=(2, 1)),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True)
+            ),
+            # 阔叶林：注重水平展开
+            nn.Sequential(
+                nn.Conv2d(channels, channels, (3, 5), padding=(1, 2)),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True)
+            ),
+            # 混合林：均衡处理
+            nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True)
+            ),
+            # 稀疏林：注重单木检测
+            nn.Sequential(
+                nn.Conv2d(channels, channels, 7, padding=3),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True)
+            )
+        ])
+        
+        # 空间注意力
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        """
+        Args:
+            x: 输入特征 [B, C, H, W]
+        Returns:
+            attended_x: 注意力处理后的特征
+        """
+        B, C, H, W = x.shape
+        
+        # 树冠类型分类
+        canopy_type_weights = self.canopy_classifier(x)  # [B, 4]
+        
+        # 自适应卷积处理
+        adaptive_features = []
+        for i, conv in enumerate(self.adaptive_convs):
+            feat = conv(x)
+            adaptive_features.append(feat)
+        
+        # 加权融合不同类型的特征
+        weighted_features = torch.zeros_like(x)
+        for i, feat in enumerate(adaptive_features):
+            weight = canopy_type_weights[:, i].view(B, 1, 1, 1)
+            weighted_features += weight * feat
+        
+        # 空间注意力
+        avg_pool = torch.mean(weighted_features, dim=1, keepdim=True)
+        max_pool, _ = torch.max(weighted_features, dim=1, keepdim=True)
+        spatial_input = torch.cat([avg_pool, max_pool], dim=1)
+        spatial_weight = self.spatial_attention(spatial_input)
+        
+        # 最终输出
+        attended_x = weighted_features * spatial_weight
+        
+        return attended_x
+
+
+class CanopyDetailPreservation(nn.Module):
+    """
+    完整的树冠细节保持模块
+    整合边缘细化和树冠感知注意力
+    """
+    
+    def __init__(self, input_channels=1):
+        super().__init__()
+        
+        self.canopy_attention = CanopyAwareAttention(input_channels)
+        self.edge_refinement = CanopyEdgeRefinement(input_channels)
+        
+        # 多尺度细节增强
+        self.detail_enhancer = nn.Sequential(
+            nn.Conv2d(input_channels, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, input_channels, 1)
+        )
+        
+    def forward(self, height_pred):
+        """
+        Args:
+            height_pred: 初始高度预测 [B, 1, H, W]
+        Returns:
+            final_height: 细节保持后的最终高度图
+            edge_map: 边缘图
+        """
+        # Step 1: 树冠感知注意力
+        attended_height = self.canopy_attention(height_pred)
+        
+        # Step 2: 边缘细化
+        refined_height, edge_map = self.edge_refinement(attended_height)
+        
+        # Step 3: 细节增强
+        detail_residual = self.detail_enhancer(refined_height)
+        final_height = refined_height + 0.1 * detail_residual
+        
+        # 最终裁剪
+        final_height = torch.clamp(final_height, 0, 1)
+        
+        return final_height, edge_map
+
 # ==================== 原有代码保持不变 ====================
 def _make_fusion_block(features, use_bn, size=None):
     """创建特征融合块"""
@@ -391,7 +669,7 @@ class SimplifiedDPTHead(nn.Module):
 
 class SimpleNDSMHead(nn.Module):
     """简单的nDSM预测头"""
-    def __init__(self, input_channels=1, enable_zero_output=True):
+    def __init__(self, input_channels=1, enable_zero_output=True,use_canopy_refinement=False):
         super().__init__()
         self.enable_zero_output = enable_zero_output
         self.layers = nn.Sequential(
@@ -413,7 +691,10 @@ class SimpleNDSMHead(nn.Module):
             
             nn.Conv2d(16, 1, kernel_size=1),
         )
-        
+        # 新增：树冠细节保持模块
+        if use_canopy_refinement:
+            self.canopy_detail_preservation = CanopyDetailPreservation(input_channels=1)
+            logging.info("启用树冠细节保持模块")
         self._initialize_weights()
     
     def _initialize_weights(self):
@@ -434,6 +715,10 @@ class SimpleNDSMHead(nn.Module):
             x = torch.clamp(x, 0, 1)
         else:
             x = torch.sigmoid(x)
+                # 新增：应用树冠细节保持
+        if self.use_canopy_refinement:
+            x_refined, edge_map = self.canopy_detail_preservation(x.unsqueeze(1))
+            x = x_refined.squeeze(1)
         
         return x.squeeze(1)
 
@@ -483,7 +768,10 @@ class GAMUSNDSMPredictor(nn.Module):
                 feature_channels=features
             )
             logging.info("启用高度感知注意力模块")
-        self.ndsm_head = SimpleNDSMHead(input_channels=1)
+        self.ndsm_head = SimpleNDSMHead(
+            input_channels=1,
+            use_canopy_refinement=use_canopy_refinement
+            )
         
         if pretrained_path and os.path.exists(pretrained_path):
             self.load_pretrained_weights(pretrained_path)
@@ -688,6 +976,7 @@ def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True
             pretrained_path=pretrained_path,
             use_adaptive_aggregation=use_adaptive_aggregation,
             use_height_attention=kwargs.get('use_height_attention', False),  # 新增参数
+            use_canopy_refinement=kwargs.get('use_canopy_refinement', False),
         )
         
         if freeze_encoder:

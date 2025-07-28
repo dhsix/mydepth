@@ -558,7 +558,8 @@ def main():
                         help='启用自适应特征聚合模块（仅对GAMUS模型有效）')
     parser.add_argument('--use_height_attention', action='store_true',
                         help='启用高度感知注意力模块（仅对GAMUS模型有效）')
-
+    parser.add_argument('--use_canopy_refinement', action='store_true',
+                        help='启用树冠细节保持模块')
     # 新增：Depth2Elevation特定参数
     parser.add_argument('--use_multi_scale_output', action='store_true',
                         help='使用多尺度输出（仅对Depth2Elevation有效）')
