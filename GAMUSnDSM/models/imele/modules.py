@@ -6,10 +6,7 @@ import torch.nn as nn
 from torch.utils import model_zoo
 import copy
 import numpy as np
-from models import senet
-from models import resnet
-from models import densenet
-
+from . import resnet, densenet, senet
 import os, sys
 import torchvision.models as models
 import torch.autograd.variable as Variable

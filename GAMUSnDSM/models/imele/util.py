@@ -2,7 +2,7 @@
 import torch
 import math
 import numpy as np
-from ssim import pytorch_ssim
+import pytorch_ssim
 from PIL import Image
 import cv2
 import torch
@@ -34,9 +34,6 @@ def setNanToZero(input, target):
 
     _input[nanMask] = 0
     _target[nanMask] = 0
-
-    #_input = torch.where(_input < torch.tensor(4), torch.tensor(0), _input)
-    #_target = torch.where(_target < torch.tensor(4), torch.tensor(0), _target)
 
 
     return _input, _target, nanMask, nValidElement

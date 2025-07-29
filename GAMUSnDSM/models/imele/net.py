@@ -9,12 +9,8 @@ import copy
 from . import util
 
 import numpy as np
-from models import modules
 from torchvision import utils
-
-from models import senet
-from models import resnet
-from models import densenet
+from . import resnet, densenet, senet,modules
 import cv2
 class model(nn.Module):
     def __init__(self, Encoder, num_features, block_channel):
