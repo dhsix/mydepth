@@ -231,7 +231,9 @@ class SimpleGAMUSValidator:
         all_preds_real = []
         all_targets_real = []
         max_samples = 200000
-        
+            # 检测是否是混合损失
+        is_hybrid_loss = (hasattr(criterion, 'update_epoch') and 
+                        hasattr(criterion, 'get_dynamic_weights'))
         with torch.no_grad():
             pbar = tqdm(val_loader, desc=f'Validation', leave=False)
             
@@ -253,9 +255,38 @@ class SimpleGAMUSValidator:
                     if torch.isnan(predictions).any() or torch.isinf(predictions).any():
                         self.logger.warning(f"预测值包含无效值，跳过批次 {batch_idx}")
                         continue
+                                    # === 修复维度一致性处理 ===
+                    if predictions.dim() == 4 and predictions.size(1) == 1:
+                        predictions = predictions.squeeze(1)
                     
+                    if predictions.shape != labels.shape:
+                        if len(predictions.shape) == 3 and len(labels.shape) == 3:
+                            if predictions.shape[-2:] != labels.shape[-2:]:
+                                predictions = F.interpolate(
+                                    predictions.unsqueeze(1), 
+                                    size=labels.shape[-2:], 
+                                    mode='bilinear', 
+                                    align_corners=False
+                                ).squeeze(1)
+                    if masks.shape != labels.shape:
+                        masks = F.interpolate(
+                            masks.unsqueeze(1), 
+                            size=labels.shape[-2:], 
+                            mode='nearest'
+                        ).squeeze(1)
+                    # 数值范围限制
+                    predictions = torch.clamp(predictions, 0, 1)
+                    labels = torch.clamp(labels, 0, 1)
+                    # === 修复损失计算逻辑 ===
+                    if is_hybrid_loss:
+                        # 混合损失：返回 (loss, loss_dict)
+                        try:
+                            loss, _ = criterion(predictions, labels, masks)
+                        except Exception as e:
+                            self.logger.warning(f"混合损失计算错误 {batch_idx}: {e}")
+                            continue
                     # 计算带mask的损失
-                    if isinstance(criterion, MaskedLoss):
+                    elif isinstance(criterion, MaskedLoss):
                         loss = criterion(predictions, labels, masks)
                     else:
                         valid_mask = (masks > 0.5) & (labels >= 0)
@@ -708,11 +739,11 @@ def add_hybrid_loss_args(parser):
                         help='使用混合空间损失函数')
     
     # 权重配置
-    parser.add_argument('--weight_normalized', type=float, default=0.5,
+    parser.add_argument('--weight_normalized', type=float, default=1,
                         help='归一化空间损失权重')
-    parser.add_argument('--weight_real', type=float, default=0.3,
+    parser.add_argument('--weight_real', type=float, default=0,
                         help='真实空间损失权重')
-    parser.add_argument('--weight_gradient', type=float, default=0.2,
+    parser.add_argument('--weight_gradient', type=float, default=0,
                         help='梯度损失权重')
     
     # Huber参数
