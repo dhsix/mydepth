@@ -728,11 +728,11 @@ def main():
     
     # 新增：模型选择参数
     parser.add_argument('--model_type', type=str, default='gamus',
-                        choices=['gamus', 'depth2elevation'],'imele',
+                        choices=['gamus', 'depth2elevation','imele',]
                         help='模型类型选择')
     
     # mask相关参数
-    parser.add_argument('--mask_dir', type=str,  default='/mnt/data1/UserData/hudong26/HeightData/',
+    parser.add_argument('--mask_dir', type=str,  default=None,
                         help='classes mask根目录 (包含train/val/classes子目录)')
     parser.add_argument('--building_class_id', type=int, default=3,
                         help='建筑类别ID')
@@ -744,7 +744,7 @@ def main():
                         help='批次大小')
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='训练轮数')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
+    parser.add_argument('--learning_rate', type=float, default=5e-6,
                         help='学习率')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='数据加载线程数')
