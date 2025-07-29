@@ -365,15 +365,18 @@ class SimpleGAMUSValidator:
         
         if is_best:
             self.logger.info('  ★ 最佳验证性能 ★')
-
 class MaskedLoss(nn.Module):
-    """带mask的损失函数包装器"""
+    """带mask的损失函数包装器 - 修复版本"""
     
     def __init__(self, base_criterion):
         super().__init__()
         self.base_criterion = base_criterion
     
     def forward(self, predictions, targets, masks):
+        # 确保所有tensor维度一致
+        if predictions.dim() != targets.dim() or predictions.dim() != masks.dim():
+            raise ValueError(f"维度不匹配: pred={predictions.shape}, target={targets.shape}, mask={masks.shape}")
+        
         valid_mask = (masks > 0.5) & (targets >= 0)
         
         if valid_mask.sum() == 0:
@@ -383,6 +386,7 @@ class MaskedLoss(nn.Module):
         valid_targets = targets[valid_mask]
         
         return self.base_criterion(valid_preds, valid_targets)
+
 
 def validate_model_enhanced(model, val_loader, criterion, device, logger, height_normalizer, epoch=None):
     """增强的验证函数"""
@@ -394,12 +398,17 @@ def validate_model_enhanced(model, val_loader, criterion, device, logger, height
     validator.log_metrics(epoch, metrics)
     
     return metrics
-def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoch, device, logger):
-    """修改后的训练函数，完全兼容mask处理"""
+
+def train_epoch_fixed(model, train_loader, criterion, optimizer, epoch, device, logger):
+    """修复的训练函数 - 统一参数顺序"""
     model.train()
     
+    # 检查是否是混合损失
+    is_hybrid_loss = (hasattr(criterion, 'update_epoch') and 
+                     hasattr(criterion, 'get_dynamic_weights'))
+    
     # 更新损失函数的epoch信息（用于动态权重）
-    if hasattr(criterion, 'update_epoch'):
+    if is_hybrid_loss:
         criterion.update_epoch(epoch)
     
     total_loss = 0
@@ -417,19 +426,17 @@ def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoc
     
     for batch_idx, batch_data in enumerate(pbar):
         try:
-            # === 兼容原来的mask加载逻辑 ===
+            # === 兼容的数据加载逻辑 ===
             if len(batch_data) == 3:
-                # 包含mask的情况
                 images, targets, masks = batch_data
                 images = images.to(device)
                 targets = targets.to(device)
                 masks = masks.to(device)
             else:
-                # 不包含mask的情况
                 images, targets = batch_data
                 images = images.to(device)
                 targets = targets.to(device)
-                masks = torch.ones_like(targets).to(device)  # 创建全1的mask
+                masks = torch.ones_like(targets).to(device)
             
             # 数据检查
             if torch.isnan(images).any() or torch.isnan(targets).any():
@@ -446,48 +453,87 @@ def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoc
                 logger.warning(f"批次{batch_idx}: 预测包含异常值")
                 continue
             
-            # 确保维度一致
+            # === 修复维度一致性处理 ===
+            # 确保所有tensor都是正确的维度
+            if preds.dim() == 4 and preds.size(1) == 1:
+                preds = preds.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
+            elif preds.dim() == 2:
+                # 如果pred是2D，可能需要reshape
+                batch_size = images.size(0)
+                if preds.size(0) == batch_size * 448 * 448:
+                    preds = preds.view(batch_size, 448, 448)
+                else:
+                    logger.warning(f"批次{batch_idx}: 预测维度异常 {preds.shape}")
+                    continue
+            
+            # 确保targets维度正确
+            if targets.dim() == 4 and targets.size(1) == 1:
+                targets = targets.squeeze(1)
+            elif targets.dim() == 2 and targets.size(0) != preds.size(0):
+                # 可能需要reshape
+                batch_size = images.size(0)
+                if targets.size(0) == batch_size * 448 * 448:
+                    targets = targets.view(batch_size, 448, 448)
+            
+            # 确保masks维度正确
+            if masks.dim() == 4 and masks.size(1) == 1:
+                masks = masks.squeeze(1)
+            elif masks.dim() == 2 and masks.size(0) != preds.size(0):
+                batch_size = images.size(0)
+                if masks.size(0) == batch_size * 448 * 448:
+                    masks = masks.view(batch_size, 448, 448)
+            
+            # 最终维度检查
             if preds.shape != targets.shape:
-                if preds.dim() == 4 and targets.dim() == 3:
-                    preds = preds.squeeze(1)
-                elif preds.shape[-2:] != targets.shape[-2:]:
-                    targets = F.interpolate(
-                        targets.unsqueeze(1) if targets.dim() == 3 else targets,
-                        size=preds.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    if targets.dim() == 4:
-                        targets = targets.squeeze(1)
+                # 使用插值调整尺寸
+                if len(preds.shape) == 3 and len(targets.shape) == 3:
+                    if preds.shape[-2:] != targets.shape[-2:]:
+                        preds = F.interpolate(
+                            preds.unsqueeze(1), 
+                            size=targets.shape[-2:], 
+                            mode='bilinear', 
+                            align_corners=False
+                        ).squeeze(1)
+                else:
+                    logger.warning(f"批次{batch_idx}: 维度不匹配 pred={preds.shape}, target={targets.shape}")
+                    continue
+            
+            # 确保masks与targets形状一致
+            if masks.shape != targets.shape:
+                masks = F.interpolate(
+                    masks.unsqueeze(1), 
+                    size=targets.shape[-2:], 
+                    mode='nearest'
+                ).squeeze(1)
             
             # 数值范围限制
             preds = torch.clamp(preds, 0, 1)
             targets = torch.clamp(targets, 0, 1)
             
-            # === 兼容的损失计算逻辑 ===
-            if hasattr(criterion, 'forward') and hasattr(criterion, 'update_epoch'):
-                # 混合损失：返回总损失和详细信息
-                loss, loss_dict = criterion(preds, targets, masks)
-                
-                # 记录各组件损失
-                loss_components['total'].append(loss_dict['total'])
-                loss_components['normalized'].append(loss_dict['normalized'])
-                loss_components['real_space'].append(loss_dict['real_space'])
-                loss_components['gradient'].append(loss_dict['gradient'])
-                
+            # === 修复的损失计算逻辑 ===
+            if is_hybrid_loss:
+                # 混合损失：直接调用，内部已处理mask
+                try:
+                    loss, loss_dict = criterion(preds, targets, masks)
+                    
+                    # 记录各组件损失
+                    loss_components['total'].append(loss_dict['total'])
+                    loss_components['normalized'].append(loss_dict['normalized'])
+                    loss_components['real_space'].append(loss_dict['real_space'])
+                    loss_components['gradient'].append(loss_dict['gradient'])
+                    
+                except Exception as e:
+                    logger.warning(f"批次{batch_idx}: 混合损失计算错误: {e}")
+                    continue
+                    
             else:
-                # 传统损失处理（兼容原来的逻辑）
-                if hasattr(criterion, '__class__') and 'MaskedLoss' in str(criterion.__class__):
-                    # 如果是MaskedLoss类型
+                # 传统损失：已被MaskedLoss包装
+                try:
                     loss = criterion(preds, targets, masks)
-                else:
-                    # 传统损失函数，手动处理mask
-                    valid_mask = (masks > 0.5) & (targets >= 0)
-                    if valid_mask.sum() == 0:
-                        continue
-                    loss = criterion(preds[valid_mask], targets[valid_mask])
-                
-                loss_components['total'].append(loss.item())
+                    loss_components['total'].append(loss.item())
+                except Exception as e:
+                    logger.warning(f"批次{batch_idx}: 传统损失计算错误: {e}")
+                    continue
             
             # 损失检查
             if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 100:
@@ -503,13 +549,12 @@ def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoc
             total_count += 1
             
             # 更新进度条
-            if hasattr(criterion, 'update_epoch'):
-                # 显示详细的损失信息
+            if is_hybrid_loss and len(loss_components['normalized']) > 0:
                 pbar.set_postfix({
                     'loss': f'{loss.item():.6f}',
-                    'norm': f'{loss_dict["normalized"]:.6f}',
-                    'real': f'{loss_dict["real_space"]:.6f}', 
-                    'grad': f'{loss_dict["gradient"]:.6f}'
+                    'norm': f'{loss_components["normalized"][-1]:.6f}',
+                    'real': f'{loss_components["real_space"][-1]:.6f}', 
+                    'grad': f'{loss_components["gradient"][-1]:.6f}'
                 })
             else:
                 pbar.set_postfix({
@@ -528,12 +573,14 @@ def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoc
                 continue
         except Exception as e:
             logger.error(f"未知错误: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     avg_loss = total_loss / total_count if total_count > 0 else float('inf')
     
     # 记录详细的损失统计
-    if loss_components['normalized']:  # 如果使用混合损失
+    if is_hybrid_loss and loss_components['normalized']:
         avg_normalized = np.mean(loss_components['normalized'])
         avg_real = np.mean(loss_components['real_space'])
         avg_gradient = np.mean(loss_components['gradient'])
@@ -544,7 +591,6 @@ def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoc
         logger.info(f"  真实空间损失: {avg_real:.6f}")
         logger.info(f"  梯度损失: {avg_gradient:.6f}")
         
-        # 返回详细信息用于监控
         return avg_loss, {
             'total': avg_loss,
             'normalized': avg_normalized,
@@ -554,6 +600,7 @@ def train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoc
     else:
         logger.info(f"Epoch {epoch} 训练完成 - 平均损失: {avg_loss:.6f}")
         return avg_loss, {'total': avg_loss}
+
 
 def train_epoch(model, train_loader, criterion, optimizer, device, logger, epoch):
     """训练一个epoch（支持mask）"""
@@ -626,40 +673,6 @@ def train_epoch(model, train_loader, criterion, optimizer, device, logger, epoch
     logger.info(f"Epoch {epoch} 训练完成 - 平均损失: {avg_loss:.6f}")
     
     return avg_loss
-# ===== 6. 统一的训练函数入口 =====
-def train_epoch_unified(model, train_loader, criterion, optimizer, epoch, device, logger, use_hybrid_loss=False):
-    """
-    统一的训练函数入口，自动选择训练方式
-    
-    Args:
-        model: 模型
-        train_loader: 数据加载器
-        criterion: 损失函数
-        optimizer: 优化器
-        epoch: 当前epoch
-        device: 设备
-        logger: 日志器
-        use_hybrid_loss: 是否使用混合损失（自动检测）
-        
-    Returns:
-        train_loss: 训练损失
-        loss_dict: 损失详细信息（如果是混合损失）
-    """
-    
-    # 自动检测是否是混合损失
-    is_hybrid = (hasattr(criterion, 'update_epoch') and 
-                hasattr(criterion, 'get_dynamic_weights') and
-                hasattr(criterion, 'compute_real_space_loss'))
-    
-    if is_hybrid or use_hybrid_loss:
-        # 使用混合损失训练
-        logger.info(f"使用混合损失训练 - Epoch {epoch}")
-        return train_epoch_with_hybrid_loss(model, train_loader, criterion, optimizer, epoch, device, logger)
-    else:
-        # 使用传统训练
-        logger.info(f"使用传统损失训练 - Epoch {epoch}")
-        traditional_loss = train_epoch(model, train_loader, criterion, optimizer, device, logger, epoch)
-        return traditional_loss, {'total': traditional_loss}
 def save_checkpoint(epoch, model, optimizer, loss, save_dir, is_best=False, model_type='gamus'):
     """保存检查点"""
     checkpoint = {
@@ -728,7 +741,7 @@ def main():
     
     # 新增：模型选择参数
     parser.add_argument('--model_type', type=str, default='gamus',
-                        choices=['gamus', 'depth2elevation','imele',]
+                        choices=['gamus', 'depth2elevation','imele'],
                         help='模型类型选择')
     
     # mask相关参数
@@ -921,40 +934,32 @@ def main():
             # 使用混合空间损失
             criterion = create_hybrid_loss(
                 height_normalizer=height_normalizer,
-                base_loss_type=args.loss_type,  # 'huber', 'mse', 'mae'
-                
-                # 混合权重配置
-                weight_normalized=0.5,      # 可以作为超参数调优
-                weight_real=0.3,
-                weight_gradient=0.2,
-                
-                # Huber参数
-                huber_delta_norm=0.05,      # 归一化空间：更小的delta
-                huber_delta_real=2.0,       # 真实空间：米为单位
-                
-                # 动态权重
-                use_dynamic_weights=True,
-                warmup_epochs=args.epochs // 4,  # 1/4训练时间作为热身
-                
-                # 高度感知
+                base_loss_type=args.loss_type,
+                weight_normalized=args.weight_normalized,
+                weight_real=args.weight_real,
+                weight_gradient=args.weight_gradient,
+                huber_delta_norm=args.huber_delta_norm,
+                huber_delta_real=args.huber_delta_real,
+                use_dynamic_weights=args.use_dynamic_weights,
+                warmup_epochs=int(args.num_epochs * args.warmup_ratio),
                 height_aware=True
             )
-            
             logging.info("使用混合空间损失函数")
             
         else:
             # 使用原有的损失函数
-            criterion = create_height_loss(
+            base_criterion = create_height_loss(
                 loss_type=args.loss_type,
-                height_aware=True,
+                height_aware=args.height_aware,
                 height_normalizer=height_normalizer,
                 min_height=min_height,
                 max_height=max_height
             )
-            
+            # 包装为带mask的损失函数
+            criterion = MaskedLoss(base_criterion)
             logging.info("使用传统损失函数")
-        # 包装为带mask的损失函数
-        criterion = MaskedLoss(base_criterion)
+
+
         
         logger.info(f"📊 损失函数配置:")
         logger.info(f"   类型: {args.loss_type} (带mask)")
@@ -971,10 +976,9 @@ def main():
         
         for epoch in range(1, args.num_epochs + 1):
             # 训练
-            train_loss, train_loss_dict = train_epoch_unified(
-                model, train_loader, criterion, optimizer, device, logger, epoch
+            train_loss, train_loss_dict = train_epoch_fixed(
+                model, train_loader, criterion, optimizer, epoch, device, logger
             )
-            
             # 验证
             if epoch % args.val_interval == 0:
                 val_metrics = validate_model_enhanced(
