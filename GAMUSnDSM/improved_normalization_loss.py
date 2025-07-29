@@ -199,7 +199,7 @@ class ImprovedHeightLoss(nn.Module):
     def __init__(self, 
                  loss_type='mse',
                  height_aware=True,
-                 huber_delta=0.1,
+                 huber_delta=0.05,
                  focal_alpha=2.0,
                  weights=None,
                  ground_constraint_weight=0.2,
