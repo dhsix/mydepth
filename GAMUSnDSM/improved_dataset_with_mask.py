@@ -254,9 +254,9 @@ class GAMUSDataset(Dataset):
                 transforms.RandomRotation(degrees=5, fill=0),
             ])
         
-        transform_list.append(
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        )
+        # transform_list.append(
+        #     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # )
         
         return transforms.Compose(transform_list)
     
