@@ -26,7 +26,362 @@ except ImportError as e:
         pass
     def _make_scratch(*args, **kwargs):
         pass
+# ==================== 阶段一：认知不确定性支持 ====================
+# 在文件顶部的导入部分添加
 
+class UncertaintySimpleNDSMHead(nn.Module):
+    """支持认知不确定性的SimpleNDSMHead"""
+    
+    def __init__(self, input_channels=1, enable_zero_output=True, use_canopy_refinement=False, dropout_rate=0.1):
+        super().__init__()
+        self.enable_zero_output = enable_zero_output
+        self.use_canopy_refinement = use_canopy_refinement
+        self.dropout_rate = dropout_rate
+        
+        # 基于您现有SimpleNDSMHead的结构，添加dropout层
+        self.layers = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=7, padding=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),  # 添加dropout用于不确定性
+            
+            nn.Conv2d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),  # 添加dropout
+            
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),  # 添加dropout
+            
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(16, 1, kernel_size=1),
+        )
+        
+        # 如果启用树冠细化，使用现有的模块
+        if use_canopy_refinement:
+            try:
+                self.canopy_detail_preservation = CanopyDetailPreservation(input_channels=1)
+                logging.info("启用树冠细节保持模块")
+            except:
+                logging.warning("无法启用树冠细化模块")
+                self.use_canopy_refinement = False
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """与您现有的初始化方法保持一致"""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+    
+    def forward(self, x):
+        """前向传播"""
+        x = self.layers(x)
+        
+        if self.enable_zero_output:
+            x = F.relu(x)
+            x = torch.clamp(x, 0, 1)
+        else:
+            x = torch.sigmoid(x)
+        
+        # 应用树冠细节保持（如果启用）
+        if self.use_canopy_refinement:
+            x_refined, edge_map = self.canopy_detail_preservation(x.unsqueeze(1))
+            x = x_refined.squeeze(1)
+        
+        return x.squeeze(1)
+
+
+class UncertaintyGAMUSNDSMPredictor(nn.Module):
+    """支持认知不确定性的GAMUS模型"""
+    
+    def __init__(self, 
+                 encoder='vits',
+                 features=256,
+                 use_pretrained_dpt=True,
+                 use_adaptive_aggregation=False,
+                 use_height_attention=False,
+                 use_canopy_refinement=False,
+                 pretrained_path=None,
+                 # 新增不确定性参数
+                 enable_uncertainty=False,
+                 dropout_rate=0.1,
+                 n_mc_samples=10):
+        super().__init__()
+        
+        self.encoder = encoder
+        self.use_pretrained_dpt = use_pretrained_dpt
+        self.enable_uncertainty = enable_uncertainty
+        self.dropout_rate = dropout_rate
+        self.n_mc_samples = n_mc_samples
+        self._uncertainty_mode = False
+        
+        self.intermediate_layer_idx = {
+            'vits': [2, 5, 8, 11],
+            'vitb': [2, 5, 8, 11],
+            'vitl': [4, 11, 17, 23],
+        }
+        
+        # 编码器初始化（与原有逻辑相同）
+        if DINOV2_AVAILABLE and encoder in ['vits', 'vitb', 'vitl']:
+            logging.info(f"使用DINOv2编码器: {encoder}")
+            self.pretrained = DINOv2(model_name=encoder)
+            self.embed_dim = self.pretrained.embed_dim
+        else:
+            if not DINOV2_AVAILABLE:
+                raise ImportError("DINOv2模块不可用，请检查安装")
+            else:
+                raise ValueError(f"不支持的编码器: {encoder}")
+        
+        # 深度头初始化（与原有逻辑相同）
+        if use_pretrained_dpt:
+            self.depth_head = SimplifiedDPTHead(
+                self.embed_dim, 
+                features, 
+                use_bn=False,
+                use_adaptive_aggregation=use_adaptive_aggregation
+            )
+        
+        # 高度感知注意力（与原有逻辑相同）
+        self.use_height_attention = use_height_attention
+        if use_height_attention:
+            self.height_attention = HeightAwareAttention(
+                depth_channels=1,
+                feature_channels=features
+            )
+            logging.info("启用高度感知注意力模块")
+        
+        # nDSM预测头：根据是否启用不确定性选择不同版本
+        if enable_uncertainty:
+            self.ndsm_head = UncertaintySimpleNDSMHead(
+                input_channels=1,
+                enable_zero_output=True,
+                use_canopy_refinement=use_canopy_refinement,
+                dropout_rate=dropout_rate
+            )
+            logging.info(f"启用认知不确定性模式，dropout_rate={dropout_rate}, n_mc_samples={n_mc_samples}")
+        else:
+            self.ndsm_head = SimpleNDSMHead(
+                input_channels=1,
+                use_canopy_refinement=use_canopy_refinement
+            )
+        
+        # 加载预训练权重（与原有逻辑相同）
+        if pretrained_path and os.path.exists(pretrained_path):
+            self.load_pretrained_weights(pretrained_path)
+        elif pretrained_path:
+            logging.warning(f"预训练文件不存在: {pretrained_path}")
+    
+    def load_pretrained_weights(self, pretrained_path):
+        """加载预训练权重（与原有方法相同）"""
+        try:
+            logging.info(f"正在加载预训练权重: {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location='cpu')
+            
+            if isinstance(checkpoint, dict):
+                state_dict = checkpoint.get('state_dict', checkpoint)
+            else:
+                state_dict = checkpoint
+            
+            model_dict = self.state_dict()
+            pretrained_dict = {}
+            
+            for k, v in state_dict.items():
+                if k in model_dict and model_dict[k].shape == v.shape:
+                    pretrained_dict[k] = v
+                    logging.debug(f"匹配权重: {k} - {v.shape}")
+                else:
+                    logging.debug(f"跳过权重: {k} - 形状不匹配或不存在")
+            
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict, strict=False)
+            
+            logging.info(f"成功加载预训练权重: {len(pretrained_dict)}/{len(model_dict)} 个参数")
+                
+        except Exception as e:
+            logging.error(f"加载预训练权重失败: {e}")
+    
+    def enable_uncertainty_mode(self):
+        """启用不确定性估计模式"""
+        if not self.enable_uncertainty:
+            logging.warning("模型未启用不确定性支持，无法开启不确定性模式")
+            return
+        
+        self._uncertainty_mode = True
+        # 只让nDSM头保持训练模式以激活dropout
+        self.eval()
+        self.ndsm_head.train()
+        logging.info("已启用不确定性估计模式")
+    
+    def disable_uncertainty_mode(self):
+        """禁用不确定性估计模式"""
+        self._uncertainty_mode = False
+        self.eval()
+        logging.info("已禁用不确定性估计模式")
+    
+    def forward(self, x, return_uncertainty=False):
+        """前向传播 - 支持不确定性估计"""
+        
+        if self.enable_uncertainty and return_uncertainty and self._uncertainty_mode:
+            return self._uncertainty_forward(x)
+        else:
+            return self._deterministic_forward(x)
+    
+    def _deterministic_forward(self, x):
+        """确定性前向传播（与原有GAMUSNDSMPredictor相同）"""
+        batch_size = x.shape[0]
+        patch_h = patch_w = 32
+        
+        # 特征提取
+        features = self.pretrained.get_intermediate_layers(
+            x, 
+            self.intermediate_layer_idx[self.encoder],
+            return_class_token=True
+        )
+        
+        # 深度预测
+        if self.use_pretrained_dpt:
+            depth = self.depth_head(features, patch_h, patch_w)
+            depth = F.relu(depth)
+        else:
+            last_feature = features[-1][0]
+            if last_feature.dim() == 3:
+                last_feature = last_feature.permute(0, 2, 1).reshape(
+                    batch_size, -1, patch_h, patch_w
+                )
+            
+            depth = F.interpolate(
+                last_feature, 
+                size=(448, 448), 
+                mode='bilinear', 
+                align_corners=False
+            )
+            if depth.shape[1] > 1:
+                depth = F.conv2d(depth, 
+                               torch.ones(1, depth.shape[1], 1, 1, device=depth.device) / depth.shape[1],
+                               bias=None)
+            depth = F.relu(depth)
+        
+        # 应用高度感知注意力
+        if self.use_height_attention:
+            depth = self.height_attention(depth)
+        
+        # nDSM预测
+        ndsm_pred = self.ndsm_head(depth)
+        
+        return ndsm_pred
+    
+    def _uncertainty_forward(self, x):
+        """不确定性前向传播 - Monte Carlo Dropout"""
+        
+        # 保存当前训练状态
+        training_states = {}
+        for name, module in self.named_modules():
+            training_states[name] = module.training
+        
+        # 设置模式：编码器和深度头eval，nDSM头train
+        self.eval()
+        self.ndsm_head.train()
+        
+        predictions = []
+        
+        with torch.no_grad():
+            for _ in range(self.n_mc_samples):
+                pred = self._deterministic_forward(x)
+                predictions.append(pred)
+        
+        # 恢复训练状态
+        for name, module in self.named_modules():
+            module.train(training_states[name])
+        
+        predictions = torch.stack(predictions)  # [n_samples, B, H, W]
+        
+        # 计算统计量
+        mean_pred = predictions.mean(dim=0)
+        epistemic_uncertainty = predictions.var(dim=0)
+        epistemic_std = torch.sqrt(epistemic_uncertainty + 1e-8)
+        
+        return {
+            'height': mean_pred,
+            'epistemic_uncertainty': epistemic_uncertainty,
+            'epistemic_std': epistemic_std,
+            'predictions': predictions,
+            'n_samples': self.n_mc_samples
+        }
+    
+    def freeze_encoder(self, freeze=True):
+        """冻结/解冻编码器（与原有方法相同）"""
+        for param in self.pretrained.parameters():
+            param.requires_grad = not freeze
+        
+        if self.use_pretrained_dpt:
+            for param in self.depth_head.parameters():
+                param.requires_grad = not freeze
+        
+        logging.info(f"编码器参数已{'冻结' if freeze else '解冻'}")
+    
+    @torch.no_grad()
+    def predict_single_image(self, image_path, output_size=None, return_uncertainty=False):
+        """预测单张图像的nDSM（支持不确定性）"""
+        self.eval()
+        
+        if isinstance(image_path, str):
+            image = cv2.imread(image_path)
+            if image is None:
+                raise ValueError(f"无法加载图像: {image_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image = image_path
+        
+        if image.shape[:2] != (448, 448):
+            image = cv2.resize(image, (448, 448), interpolation=cv2.INTER_CUBIC)
+        
+        image = image.astype(np.float32) / 255.0
+        image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).unsqueeze(0)
+        
+        normalize = Compose([
+            lambda x: (x - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / 
+                     torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        ])
+        image_tensor = normalize(image_tensor)
+        
+        device = next(self.parameters()).device
+        image_tensor = image_tensor.to(device)
+        
+        if self.enable_uncertainty and return_uncertainty:
+            self.enable_uncertainty_mode()
+            result = self.forward(image_tensor, return_uncertainty=True)
+            
+            # 转换为numpy
+            output = {
+                'height': result['height'].cpu().numpy()[0],
+                'epistemic_uncertainty': result['epistemic_uncertainty'].cpu().numpy()[0],
+                'epistemic_std': result['epistemic_std'].cpu().numpy()[0]
+            }
+            
+            if output_size and output_size != (448, 448):
+                for key in output:
+                    output[key] = cv2.resize(output[key], output_size, interpolation=cv2.INTER_LINEAR)
+            
+            return output
+        else:
+            ndsm_pred = self.forward(image_tensor)
+            ndsm_pred = ndsm_pred.cpu().numpy()[0]
+            
+            if output_size and output_size != (448, 448):
+                ndsm_pred = cv2.resize(ndsm_pred, output_size, interpolation=cv2.INTER_LINEAR)
+            
+            return ndsm_pred
 # 在文件顶部导入
 try:
     from imele_adapter import IMELEAdapter
@@ -962,10 +1317,138 @@ class Depth2ElevationAdapter(nn.Module):
             self.model.load_pretrained_weights(pretrained_path)
         else:
             logging.warning("Depth2Elevation模型不支持load_pretrained_weights方法")
+# ==================== 完整的EpistemicUncertaintyEvaluator ====================
 
+class EpistemicUncertaintyEvaluator:
+    """认知不确定性评估器 - 完整版本"""
+    
+    @staticmethod
+    def evaluate_epistemic_uncertainty(predictions_dict, targets, masks=None):
+        """评估认知不确定性的质量 - 完整版本"""
+        
+        mean_pred = predictions_dict['height']
+        epistemic_unc = predictions_dict['epistemic_uncertainty']
+        epistemic_std = predictions_dict['epistemic_std']
+        
+        if masks is not None:
+            valid_mask = masks > 0.5
+            mean_pred = mean_pred[valid_mask]
+            targets = targets[valid_mask]
+            epistemic_unc = epistemic_unc[valid_mask]
+            epistemic_std = epistemic_std[valid_mask]
+        
+        # 1. 基础回归指标
+        mae = torch.abs(mean_pred - targets).mean()
+        rmse = torch.sqrt(((mean_pred - targets) ** 2).mean())
+        
+        # 2. 不确定性与误差的相关性
+        errors = torch.abs(mean_pred - targets)
+        if len(errors) > 1 and len(epistemic_std) > 1:
+            try:
+                correlation = torch.corrcoef(torch.stack([
+                    epistemic_std.flatten(), 
+                    errors.flatten()
+                ]))[0, 1]
+            except:
+                correlation = torch.tensor(0.0)
+        else:
+            correlation = torch.tensor(0.0)
+        
+        # 3. 校准误差 (Calibration Error)
+        calibration_error = EpistemicUncertaintyEvaluator._compute_calibration_error(
+            mean_pred, epistemic_std, targets
+        )
+        
+        # 4. 预测区间覆盖率
+        coverage_68 = EpistemicUncertaintyEvaluator._compute_coverage(
+            mean_pred, epistemic_std, targets, confidence=0.68
+        )
+        coverage_95 = EpistemicUncertaintyEvaluator._compute_coverage(
+            mean_pred, epistemic_std, targets, confidence=0.95
+        )
+        
+        # 5. 不确定性统计
+        unc_mean = torch.mean(epistemic_unc)
+        unc_std = torch.std(epistemic_unc)
+        
+        return {
+            'mae': mae.item(),
+            'rmse': rmse.item(),
+            'uncertainty_error_correlation': correlation.item() if torch.isfinite(correlation) else 0.0,
+            'calibration_error': calibration_error.item(),
+            'coverage_68': coverage_68.item(),
+            'coverage_95': coverage_95.item(),
+            'uncertainty_mean': unc_mean.item(),
+            'uncertainty_std': unc_std.item(),
+            'n_samples': len(mean_pred)
+        }
+    
+    @staticmethod
+    def _compute_calibration_error(pred_mean, pred_std, targets, n_bins=10):
+        """计算校准误差 - 完整实现"""
+        try:
+            abs_errors = torch.abs(pred_mean - targets)
+            
+            # 按不确定性大小分箱
+            sorted_indices = torch.argsort(pred_std)
+            bin_size = len(sorted_indices) // n_bins
+            
+            calibration_errors = []
+            
+            for i in range(n_bins):
+                start_idx = i * bin_size
+                if i == n_bins - 1:  # 最后一个bin包含所有剩余样本
+                    end_idx = len(sorted_indices)
+                else:
+                    end_idx = (i + 1) * bin_size
+                
+                bin_indices = sorted_indices[start_idx:end_idx]
+                
+                if len(bin_indices) == 0:
+                    continue
+                
+                bin_uncertainties = pred_std[bin_indices]
+                bin_errors = abs_errors[bin_indices]
+                
+                # 期望误差 = 平均不确定性
+                expected_error = torch.mean(bin_uncertainties)
+                # 实际误差 = 平均绝对误差
+                actual_error = torch.mean(bin_errors)
+                
+                calibration_errors.append(torch.abs(expected_error - actual_error))
+            
+            return torch.tensor(calibration_errors).mean() if calibration_errors else torch.tensor(0.0)
+        except:
+            return torch.tensor(0.0)
+    
+    @staticmethod
+    def _compute_coverage(pred_mean, pred_std, targets, confidence=0.95):
+        """计算预测区间覆盖率 - 完整实现"""
+        try:
+            if confidence == 0.68:
+                z_score = 1.0
+            elif confidence == 0.95:
+                z_score = 1.96
+            elif confidence == 0.99:
+                z_score = 2.576
+            else:
+                # 使用正态分布的分位数
+                from scipy.stats import norm
+                z_score = norm.ppf((1 + confidence) / 2)
+            
+            lower = pred_mean - z_score * pred_std
+            upper = pred_mean + z_score * pred_std
+            
+            coverage = ((targets >= lower) & (targets <= upper)).float().mean()
+            return coverage
+        except:
+            return torch.tensor(0.0)
 # ==================== 统一的模型创建函数 ====================
 def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True, 
-                      model_type='gamus',use_adaptive_aggregation=False, **kwargs):
+                      model_type='gamus',use_adaptive_aggregation=False,                       # 新增不确定性参数
+                      enable_uncertainty=False,
+                      dropout_rate=0.1,
+                      n_mc_samples=10,**kwargs):
     """
     创建模型的统一接口 - 支持多种模型类型
     
@@ -973,21 +1456,38 @@ def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True
         encoder: 编码器类型 ('vits', 'vitb', 'vitl')
         pretrained_path: 预训练权重路径
         freeze_encoder: 是否冻结编码器
+        enable_uncertainty: 是否启用不确定性支持
+        dropout_rate: dropout率（用于不确定性估计）
+        n_mc_samples: Monte Carlo采样次数
         model_type: 模型类型 ('gamus', 'depth2elevation')
         **kwargs: 其他模型特定参数
     """
     
     if model_type.lower() == 'gamus':
-        # 创建原有的GAMUS模型
-        logging.info("创建GAMUS nDSM预测模型")
-        model = GAMUSNDSMPredictor(
-            encoder=encoder,
-            use_pretrained_dpt=True,
-            pretrained_path=pretrained_path,
-            use_adaptive_aggregation=use_adaptive_aggregation,
-            use_height_attention=kwargs.get('use_height_attention', False),  # 新增参数
-            use_canopy_refinement=kwargs.get('use_canopy_refinement', False),
-        )
+                # 根据是否启用不确定性选择不同的模型类
+        if enable_uncertainty:
+            logging.info("创建支持不确定性的GAMUS nDSM预测模型")
+            model = UncertaintyGAMUSNDSMPredictor(
+                encoder=encoder,
+                use_pretrained_dpt=True,
+                pretrained_path=pretrained_path,
+                use_adaptive_aggregation=use_adaptive_aggregation,
+                use_height_attention=kwargs.get('use_height_attention', False),
+                use_canopy_refinement=kwargs.get('use_canopy_refinement', False),
+                enable_uncertainty=True,
+                dropout_rate=dropout_rate,
+                n_mc_samples=n_mc_samples
+            )
+        else:
+            logging.info("创建标准GAMUS nDSM预测模型")
+            model = GAMUSNDSMPredictor(
+                encoder=encoder,
+                use_pretrained_dpt=True,
+                pretrained_path=pretrained_path,
+                use_adaptive_aggregation=use_adaptive_aggregation,
+                use_height_attention=kwargs.get('use_height_attention', False),
+                use_canopy_refinement=kwargs.get('use_canopy_refinement', False),
+            )
         
         if freeze_encoder:
             model.freeze_encoder(True)
@@ -1042,6 +1542,8 @@ def create_gamus_model(encoder='vits', pretrained_path=None, freeze_encoder=True
     logging.info(f"模型创建完成:")
     logging.info(f"  模型类型: {model_type}")
     logging.info(f"  编码器: {encoder}")
+    if model_type.lower() == 'gamus' and enable_uncertainty:
+        logging.info(f"  不确定性支持: 启用 (dropout_rate={dropout_rate}, n_mc_samples={n_mc_samples})")
     logging.info(f"  总参数: {total_params:,}")
     logging.info(f"  可训练参数: {trainable_params:,}")
     logging.info(f"  参数比例: {trainable_params/total_params*100:.2f}%")

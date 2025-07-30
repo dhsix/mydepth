@@ -221,7 +221,7 @@ class SimpleGAMUSValidator:
         """使用归一化器将归一化的nDSM数据还原到真实高度值"""
         return self.height_normalizer.denormalize(normalized_data)
     
-    def validate_with_metrics(self, model, val_loader, criterion, device, epoch=None):
+    def validate_with_metrics(self, model, val_loader, criterion, device, epoch=None,enable_uncertainty=False):
         """执行验证并返回详细指标（支持mask）"""
         model.eval()
         
@@ -250,8 +250,30 @@ class SimpleGAMUSValidator:
                     masks = torch.ones_like(labels).to(device)
                 
                 try:
-                    predictions = model(images)
-                    
+                    # predictions = model(images)
+                    # 支持不确定性的前向传播
+                    if enable_uncertainty and hasattr(model, 'enable_uncertainty_mode'):
+                        # 启用不确定性模式
+                        model.enable_uncertainty_mode()
+                        try:
+                            result = model(images, return_uncertainty=True)
+                            if isinstance(result, dict):
+                                predictions = result['mean']
+                                # 可以收集不确定性信息
+                                epistemic_unc = result.get('epistemic_uncertainty', None)
+                                if epistemic_unc is not None:
+                                    # 这里可以添加不确定性统计，比如记录到metrics中
+                                    pass
+                            else:
+                                predictions = result
+                        except Exception as e:
+                            # 如果不确定性推理失败，使用标准推理
+                            self.logger.warning(f"不确定性推理失败，使用标准模式: {e}")
+                            predictions = model(images)
+                        finally:
+                            model.disable_uncertainty_mode()
+                    else:
+                        predictions = model(images)
                     if torch.isnan(predictions).any() or torch.isinf(predictions).any():
                         self.logger.warning(f"预测值包含无效值，跳过批次 {batch_idx}")
                         continue
@@ -423,9 +445,15 @@ def validate_model_enhanced(model, val_loader, criterion, device, logger, height
     """增强的验证函数"""
     if val_loader is None:
         return {'loss': 0.0, 'count': 0}
-    
+    # 添加不确定性检测
+    enable_uncertainty = (hasattr(model, 'enable_uncertainty') and 
+                         getattr(model, 'enable_uncertainty', False))
+    if enable_uncertainty:
+        logger.info(f"📊 Epoch {epoch}: 使用不确定性模式进行验证")
+
     validator = SimpleGAMUSValidator(height_normalizer, logger)
-    metrics = validator.validate_with_metrics(model, val_loader, criterion, device, epoch)
+    metrics = validator.validate_with_metrics(model, val_loader, criterion, device, epoch, enable_uncertainty)
+    
     validator.log_metrics(epoch, metrics)
     
     return metrics
@@ -835,6 +863,12 @@ def main():
     parser.add_argument('--backbone', type=str, default='resnet50',
                     choices=['resnet50', 'densenet161', 'senet154'],
                     help='IMELE模型的backbone类型（仅对IMELE有效）')
+                    parser.add_argument('--enable_uncertainty', action='store_true',
+                    help='启用不确定性支持（Monte Carlo Dropout）')
+    parser.add_argument('--dropout_rate', type=float, default=0.1,
+                        help='dropout率（用于不确定性估计）')
+    parser.add_argument('--n_mc_samples', type=int, default=10,
+                        help='Monte Carlo采样次数')
     # 损失函数参数
     parser.add_argument('--loss_type', type=str, default='huber',
                         choices=['mse', 'mae', 'huber', 'focal', 'combined'],
@@ -912,6 +946,10 @@ def main():
             'pretrained_path': args.pretrained_path,
             'freeze_encoder': args.freeze_encoder,
             'model_type': args.model_type
+            # 添加这三行不确定性参数
+            'enable_uncertainty': args.enable_uncertainty,
+            'dropout_rate': args.dropout_rate,
+            'n_mc_samples': args.n_mc_samples
         }
         # 为GAMUS模型添加自适应聚合参数
         if args.model_type == 'gamus':
