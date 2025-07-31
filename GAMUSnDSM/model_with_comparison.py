@@ -280,7 +280,6 @@ class UncertaintyGAMUSNDSMPredictor(nn.Module):
         ndsm_pred = self.ndsm_head(depth)
         
         return ndsm_pred
-    
     def _uncertainty_forward(self, x):
         """不确定性前向传播 - Monte Carlo Dropout"""
         
@@ -311,14 +310,14 @@ class UncertaintyGAMUSNDSMPredictor(nn.Module):
         epistemic_uncertainty = predictions.var(dim=0)
         epistemic_std = torch.sqrt(epistemic_uncertainty + 1e-8)
         
+        # 返回字典格式的结果
         return {
-            'height': mean_pred,
+            'mean': mean_pred,
             'epistemic_uncertainty': epistemic_uncertainty,
             'epistemic_std': epistemic_std,
             'predictions': predictions,
             'n_samples': self.n_mc_samples
         }
-    
     def freeze_encoder(self, freeze=True):
         """冻结/解冻编码器（与原有方法相同）"""
         for param in self.pretrained.parameters():

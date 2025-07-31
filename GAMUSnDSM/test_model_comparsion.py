@@ -424,7 +424,20 @@ def test_model_optimized(model, test_loader, device, logger, criterion=None, mem
                 
                 # 测量推理时间
                 inference_start = time.time()
-                predictions = model(images)
+                enable_uncertainty = (hasattr(model, 'enable_uncertainty') and 
+                    getattr(model, 'enable_uncertainty', False) and 
+                    getattr(args, 'test_uncertainty', False))
+                if enable_uncertainty and hasattr(model, 'enable_uncertainty_mode'):
+                    model.enable_uncertainty_mode()
+                    try:
+                        result = model(images, return_uncertainty=True)
+                        predictions = result['mean'] if isinstance(result, dict) else result
+                    except:
+                        predictions = model(images)
+                    finally:
+                        model.disable_uncertainty_mode()
+                else:
+                    predictions = model(images)
                 inference_time = time.time() - inference_start
                 inference_times.append(inference_time)
                 
@@ -662,6 +675,7 @@ def create_test_model_with_config(model_type, model_config, args, logger):
             'use_adaptive_aggregation': model_config.get('use_adaptive_aggregation', getattr(args, 'use_adaptive_aggregation', False)),
             'use_height_attention': model_config.get('use_height_attention', getattr(args, 'use_height_attention', False)),
             'use_canopy_refinement': model_config.get('use_canopy_refinement', getattr(args, 'use_canopy_refinement', False)),
+            
         })
         
     elif model_type == 'depth2elevation':
@@ -726,7 +740,9 @@ def main():
                         help='使用树冠细化（需要与训练时一致）')
     parser.add_argument('--use_multi_scale_output', action='store_true',
                         help='使用多尺度输出（需要与训练时一致）')
-    
+    # 位置1：参数解析部分（main函数中）
+    parser.add_argument('--test_uncertainty', action='store_true',
+                    help='测试时启用不确定性模式')
     # ✅ 新增：配置来源选择
     parser.add_argument('--config_source', type=str, default='checkpoint',
                         choices=['checkpoint', 'args'],
@@ -844,6 +860,10 @@ def main():
                         'use_adaptive_aggregation': args.use_adaptive_aggregation,
                         'use_height_attention': args.use_height_attention,
                         'use_canopy_refinement': args.use_canopy_refinement,
+                        # 添加这三行
+                        'enable_uncertainty': model_config.get('enable_uncertainty', False),
+                        'dropout_rate': model_config.get('dropout_rate', 0.1),
+                        'n_mc_samples': model_config.get('n_mc_samples', 10),
                     })
                     
                 # ✅ 为Depth2Elevation添加特定参数

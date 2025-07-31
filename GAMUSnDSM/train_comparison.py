@@ -816,7 +816,7 @@ def main():
                         help='批次大小')
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='训练轮数')
-    parser.add_argument('--learning_rate', type=float, default=5e-6,
+    parser.add_argument('--learning_rate', type=float, default=5e-5,
                         help='学习率')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='数据加载线程数')
